@@ -37,6 +37,7 @@ The main dashboard page.
 - Lets you clean up old logs
 - Lets you configure quiet time hours
 - Lets you enter Telegram bot and chat details for alerts
+- Lets you send a test Telegram message from the dashboard
 
 The graph library is loaded from a CDN in this file. It currently uses ApexCharts.
 

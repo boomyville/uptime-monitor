@@ -9,7 +9,10 @@ CREATE TABLE IF NOT EXISTS sites (
     alias VARCHAR(100) NOT NULL,
     is_active BOOLEAN DEFAULT 1,
     last_status INT DEFAULT NULL,
+    last_health_status VARCHAR(10) DEFAULT 'unknown', -- 'green', 'yellow', 'red'
     pending_alert BOOLEAN DEFAULT 0, -- Tracks alerts delayed due to Quiet Time
+    timeout_seconds INT DEFAULT 30,
+    retries INT DEFAULT 2,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -19,6 +22,9 @@ CREATE TABLE IF NOT EXISTS logs (
     site_id INT,
     status_code INT,
     response_time FLOAT,
+    health_status VARCHAR(10), -- 'green', 'yellow', 'red'
+    total_attempts INT DEFAULT 1,
+    cumulative_time FLOAT, -- total time including retries
     checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     INDEX(site_id),
     INDEX(checked_at),
@@ -32,11 +38,14 @@ CREATE TABLE IF NOT EXISTS config (
 );
 
 -- 5. Seed Initial Config Data
--- NOTE: Change 'password123' to something secure immediately!
 INSERT INTO config (setting_key, setting_value) VALUES 
 ('telegram_bot_token', ''), 
 ('telegram_chat_id', ''),
-('admin_password', 'password123'), 
+('admin_username', ''),
+('admin_password_hash', ''),
+('admin_password_salt', ''),
 ('active_start_hour', '08'),       -- Notifications start at 8 AM
 ('active_end_hour', '22'),         -- Notifications stop at 10 PM
-('timezone', 'Australia/Melbourne');
+('timezone', 'Australia/Melbourne'),
+('default_timeout', '30'),         -- Default timeout in seconds
+('default_retries', '2');          -- Default number of retries

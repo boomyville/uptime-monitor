@@ -2,6 +2,7 @@
 require_once __DIR__ . '/config.php';
 
 $pdo = getDbConnection();
+ensureSchema($pdo);
 
 // Load Config from DB
 $config = [];
@@ -11,6 +12,8 @@ foreach ($pdo->query("SELECT * FROM config") as $row) {
 
 $quietStartHour = (int)($config['quiet_start_hour'] ?? $config['active_end_hour'] ?? 22);
 $quietEndHour = (int)($config['quiet_end_hour'] ?? $config['active_start_hour'] ?? 8);
+$defaultTimeout = (int)($config['default_timeout'] ?? 30);
+$defaultRetries = (int)($config['default_retries'] ?? 2);
 
 function isQuietTime(int $currentHour, int $quietStartHour, int $quietEndHour): bool {
     if ($quietStartHour === $quietEndHour) {
@@ -24,6 +27,116 @@ function isQuietTime(int $currentHour, int $quietStartHour, int $quietEndHour): 
     return $currentHour >= $quietStartHour || $currentHour < $quietEndHour;
 }
 
+/**
+ * Performs a ping with retry logic
+ * Returns: [
+ *   'status_code' => int,
+ *   'response_time' => float (first attempt time),
+ *   'cumulative_time' => float (total time including all retries),
+ *   'total_attempts' => int,
+ *   'health_status' => 'green'|'yellow'|'red'
+ * ]
+ */
+function pingWithRetries($url, $timeout, $maxRetries) {
+    $cumulativeTime = 0;
+    $finalStatusCode = 0;
+    $firstAttemptTime = 0;
+    $attemptCount = 0;
+    $allFailed = true;
+
+    for ($attempt = 0; $attempt <= $maxRetries; $attempt++) {
+        $attemptCount++;
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => $timeout,
+            CURLOPT_CONNECTTIMEOUT => $timeout,
+            CURLOPT_USERAGENT => 'UptimeMonitor/1.0',
+            CURLOPT_FAILONERROR => false
+        ]);
+        
+        $start = microtime(true);
+        curl_exec($ch);
+        $elapsed = (microtime(true) - $start) * 1000; // Convert to ms
+        $http_code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        // Store first attempt time
+        if ($attempt === 0) {
+            $firstAttemptTime = round($elapsed, 2);
+        }
+
+        $cumulativeTime += $elapsed;
+        $finalStatusCode = $http_code;
+
+        // Check if this attempt succeeded (HTTP code < 400, or code > 0)
+        $isSuccess = ($http_code > 0 && $http_code < 400);
+        
+        if ($isSuccess) {
+            $allFailed = false;
+            break; // Success! Stop retrying
+        }
+    }
+
+    // Determine health status
+    if ($attemptCount === 1 && $finalStatusCode > 0 && $finalStatusCode < 400) {
+        // Green: succeeded on first try
+        $healthStatus = 'green';
+    } elseif (!$allFailed) {
+        // Yellow: failed at least once, but eventually succeeded
+        $healthStatus = 'yellow';
+    } else {
+        // Red: failed all retries
+        $healthStatus = 'red';
+    }
+
+    return [
+        'status_code' => $finalStatusCode,
+        'response_time' => $firstAttemptTime,
+        'cumulative_time' => round($cumulativeTime, 2),
+        'total_attempts' => $attemptCount,
+        'health_status' => $healthStatus
+    ];
+}
+
+function sendTelegram($msg, $config) {
+    if (empty($config['telegram_bot_token']) || empty($config['telegram_chat_id'])) return;
+
+    $url = "https://api.telegram.org/bot{$config['telegram_bot_token']}/sendMessage";
+    $data = [
+        'chat_id' => $config['telegram_chat_id'],
+        'text' => $msg,
+    ];
+
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => http_build_query($data),
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CONNECTTIMEOUT => 10,
+        CURLOPT_TIMEOUT => 15,
+        CURLOPT_HTTPHEADER => ['Content-Type: application/x-www-form-urlencoded'],
+    ]);
+
+    $response = curl_exec($ch);
+    $curlError = curl_error($ch);
+    $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    if ($curlError !== '') {
+        error_log('Telegram send failed: ' . $curlError);
+        return false;
+    }
+
+    $decoded = json_decode($response ?: '', true);
+    if (!is_array($decoded) || empty($decoded['ok'])) {
+        error_log('Telegram send failed: ' . ($response ?: 'no response'));
+        return false;
+    }
+
+    return $httpCode >= 200 && $httpCode < 300;
+}
+
 // Set Timezone and check Quiet Time
 date_default_timezone_set($config['timezone'] ?? 'UTC');
 $currentHour = (int)date('H');
@@ -32,41 +145,70 @@ $isQuietTime = isQuietTime($currentHour, $quietStartHour, $quietEndHour);
 $sites = $pdo->query("SELECT * FROM sites WHERE is_active = 1")->fetchAll();
 
 foreach ($sites as $site) {
-    $ch = curl_init($site['url']);
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT => 10,
-        CURLOPT_USERAGENT => 'UptimeMonitor/1.0'
-    ]);
+    $timeout = (int)($site['timeout_seconds'] ?? $defaultTimeout);
+    $retries = (int)($site['retries'] ?? $defaultRetries);
     
-    $start = microtime(true);
-    curl_exec($ch);
-    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $time = round((microtime(true) - $start) * 1000, 2);
-    curl_close($ch);
+    // Perform ping with retries
+    $result = pingWithRetries($site['url'], $timeout, $retries);
+    
+    // Log the result
+    $stmt = $pdo->prepare(
+        "INSERT INTO logs (site_id, status_code, response_time, cumulative_time, total_attempts, health_status) 
+         VALUES (?, ?, ?, ?, ?, ?)"
+    );
+    $stmt->execute([
+        $site['id'],
+        $result['status_code'],
+        $result['response_time'],
+        $result['cumulative_time'],
+        $result['total_attempts'],
+        $result['health_status']
+    ]);
 
-    // Log the ping
-    $stmt = $pdo->prepare("INSERT INTO logs (site_id, status_code, response_time) VALUES (?, ?, ?)");
-    $stmt->execute([$site['id'], $http_code, $time]);
+    // Update site's current status
+    $pdo->prepare("UPDATE sites SET last_status = ?, last_health_status = ? WHERE id = ?")
+        ->execute([$result['status_code'], $result['health_status'], $site['id']]);
 
-    $isDown = ($http_code == 0 || $http_code >= 400);
+    // Determine if we should alert
+    $isDown = ($result['health_status'] === 'red');
+    
+    if ($result['health_status'] === 'green') {
+        $alertEmoji = '✅';
+    } elseif ($result['health_status'] === 'yellow') {
+        $alertEmoji = '🟨';
+    } elseif ($result['health_status'] === 'red') {
+        $alertEmoji = '🚨';
+    } else {
+        $alertEmoji = '❓';
+    }
 
     if ($isDown) {
         if ($isQuietTime) {
             // Flag for later notification
-            $pdo->prepare("UPDATE sites SET last_status = ?, pending_alert = 1 WHERE id = ?")
-                ->execute([$http_code, $site['id']]);
+            $pdo->prepare("UPDATE sites SET pending_alert = 1 WHERE id = ?")
+                ->execute([$site['id']]);
         } else {
             // Send Alert Immediately
-            sendTelegram("🚨 ALERT: {$site['alias']} ({$site['url']}) is DOWN. Status: $http_code", $config);
-            $pdo->prepare("UPDATE sites SET last_status = ?, pending_alert = 0 WHERE id = ?")
-                ->execute([$http_code, $site['id']]);
+            $attemptsInfo = $result['total_attempts'] > 1 
+                ? " (failed after {$result['total_attempts']} attempts)" 
+                : '';
+            sendTelegram(
+                "$alertEmoji ALERT: {$site['alias']} ({$site['url']}) is DOWN. Status: {$result['status_code']}{$attemptsInfo}",
+                $config
+            );
+            $pdo->prepare("UPDATE sites SET pending_alert = 0 WHERE id = ?")
+                ->execute([$site['id']]);
         }
-    } else {
-        // Site is Up
-        $pdo->prepare("UPDATE sites SET last_status = ?, pending_alert = 0 WHERE id = ?")
-            ->execute([$http_code, $site['id']]);
+    } elseif ($result['health_status'] === 'yellow') {
+        // Yellow status - recovered after retries
+        if (!$isQuietTime) {
+            sendTelegram(
+                "$alertEmoji RECOVERED: {$site['alias']} recovered after {$result['total_attempts']} attempts. Response Time: {$result['cumulative_time']}ms",
+                $config
+            );
+        }
     }
+    // Green status - no alert needed
 }
 
 // Catch-up logic: If we just entered active hours, send pending alerts
@@ -76,19 +218,4 @@ if (!$isQuietTime) {
         sendTelegram("🌅 Morning Catch-up: {$site['alias']} is still DOWN (Status: {$site['last_status']})", $config);
         $pdo->prepare("UPDATE sites SET pending_alert = 0 WHERE id = ?")->execute([$site['id']]);
     }
-}
-
-function sendTelegram($msg, $config) {
-    if (empty($config['telegram_bot_token']) || empty($config['telegram_chat_id'])) return;
-    $url = "https://api.telegram.org/bot{$config['telegram_bot_token']}/sendMessage";
-    $data = ['chat_id' => $config['telegram_chat_id'], 'text' => $msg];
-    
-    $options = [
-        'http' => [
-            'method'  => 'POST',
-            'header'  => "Content-type: application/x-www-form-urlencoded\r\n",
-            'content' => http_build_query($data)
-        ]
-    ];
-    @file_get_contents($url, false, stream_context_create($options));
 }

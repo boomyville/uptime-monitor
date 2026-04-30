@@ -2,20 +2,234 @@
 session_start();
 require_once 'config.php';
 $pdo = getDbConnection();
+ensureSchema($pdo);
 
 // --- Logic Helpers ---
 
-function pingSite($pdo, $id, $url, $alias) {
-    $ch = curl_init($url);
-    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 5]);
-    $start = microtime(true);
-    curl_exec($ch);
-    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $time = round((microtime(true) - $start) * 1000, 2);
-    curl_close($ch);
+/**
+ * Performs a ping with retry logic
+ * Returns: [
+ *   'status_code' => int,
+ *   'response_time' => float (first attempt time),
+ *   'cumulative_time' => float (total time including all retries),
+ *   'total_attempts' => int,
+ *   'health_status' => 'green'|'yellow'|'red'
+ * ]
+ */
+function pingWithRetries($url, $timeout, $maxRetries) {
+    $cumulativeTime = 0;
+    $finalStatusCode = 0;
+    $firstAttemptTime = 0;
+    $attemptCount = 0;
+    $allFailed = true;
 
-    $pdo->prepare("INSERT INTO logs (site_id, status_code, response_time) VALUES (?, ?, ?)")->execute([$id, $http_code, $time]);
-    $pdo->prepare("UPDATE sites SET last_status = ? WHERE id = ?")->execute([$http_code, $id]);
+    for ($attempt = 0; $attempt <= $maxRetries; $attempt++) {
+        $attemptCount++;
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => $timeout,
+            CURLOPT_CONNECTTIMEOUT => $timeout,
+            CURLOPT_USERAGENT => 'UptimeMonitor/1.0',
+            CURLOPT_FAILONERROR => false
+        ]);
+        
+        $start = microtime(true);
+        curl_exec($ch);
+        $elapsed = (microtime(true) - $start) * 1000; // Convert to ms
+        $http_code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        // Store first attempt time
+        if ($attempt === 0) {
+            $firstAttemptTime = round($elapsed, 2);
+        }
+
+        $cumulativeTime += $elapsed;
+        $finalStatusCode = $http_code;
+
+        // Check if this attempt succeeded (HTTP code < 400, or code > 0)
+        $isSuccess = ($http_code > 0 && $http_code < 400);
+        
+        if ($isSuccess) {
+            $allFailed = false;
+            break; // Success! Stop retrying
+        }
+    }
+
+    // Determine health status
+    if ($attemptCount === 1 && $finalStatusCode > 0 && $finalStatusCode < 400) {
+        // Green: succeeded on first try
+        $healthStatus = 'green';
+    } elseif (!$allFailed) {
+        // Yellow: failed at least once, but eventually succeeded
+        $healthStatus = 'yellow';
+    } else {
+        // Red: failed all retries
+        $healthStatus = 'red';
+    }
+
+    return [
+        'status_code' => $finalStatusCode,
+        'response_time' => $firstAttemptTime,
+        'cumulative_time' => round($cumulativeTime, 2),
+        'total_attempts' => $attemptCount,
+        'health_status' => $healthStatus
+    ];
+}
+
+function pingSite($pdo, $id, $url, $alias, $timeout = 30, $retries = 2) {
+    $result = pingWithRetries($url, $timeout, $retries);
+    
+    $pdo->prepare(
+        "INSERT INTO logs (site_id, status_code, response_time, cumulative_time, total_attempts, health_status) 
+         VALUES (?, ?, ?, ?, ?, ?)"
+    )->execute([
+        $id,
+        $result['status_code'],
+        $result['response_time'],
+        $result['cumulative_time'],
+        $result['total_attempts'],
+        $result['health_status']
+    ]);
+    
+    $pdo->prepare("UPDATE sites SET last_status = ?, last_health_status = ? WHERE id = ?")
+        ->execute([$result['status_code'], $result['health_status'], $id]);
+}
+
+// Load config defaults
+$configDefaults = $pdo->query("SELECT setting_key, setting_value FROM config")->fetchAll(PDO::FETCH_KEY_PAIR);
+$defaultTimeout = (int)($configDefaults['default_timeout'] ?? 30);
+$defaultRetries = (int)($configDefaults['default_retries'] ?? 2);
+$adminUsername = trim((string)($configDefaults['admin_username'] ?? ''));
+$adminPasswordHash = (string)($configDefaults['admin_password_hash'] ?? '');
+$adminPasswordSalt = (string)($configDefaults['admin_password_salt'] ?? '');
+$isAdminConfigured = $adminUsername !== '' && $adminPasswordHash !== '' && $adminPasswordSalt !== '';
+
+if (isset($_POST['admin_logout'])) {
+    unset($_SESSION['is_admin_authenticated'], $_SESSION['admin_username']);
+    session_regenerate_id(true);
+    header('Location: index.php');
+    exit;
+}
+
+if (!$isAdminConfigured && isset($_POST['setup_admin'])) {
+    $setupUsername = trim((string)($_POST['setup_username'] ?? ''));
+    $setupPassword = (string)($_POST['setup_password'] ?? '');
+    $setupPasswordConfirm = (string)($_POST['setup_password_confirm'] ?? '');
+
+    if (strlen($setupUsername) < 3) {
+        $_SESSION['auth_flash_message'] = 'Username must be at least 3 characters.';
+        $_SESSION['auth_flash_type'] = 'error';
+    } elseif (strlen($setupPassword) < 8) {
+        $_SESSION['auth_flash_message'] = 'Password must be at least 8 characters.';
+        $_SESSION['auth_flash_type'] = 'error';
+    } elseif (!preg_match('/^(?=.*[A-Za-z])(?=.*\d).{8,}$/', $setupPassword)) {
+        $_SESSION['auth_flash_message'] = 'Password must include at least one letter and one number.';
+        $_SESSION['auth_flash_type'] = 'error';
+    } elseif (!hash_equals($setupPassword, $setupPasswordConfirm)) {
+        $_SESSION['auth_flash_message'] = 'Password confirmation does not match.';
+        $_SESSION['auth_flash_type'] = 'error';
+    } else {
+        $salt = bin2hex(random_bytes(16));
+        $passwordHash = password_hash($setupPassword . $salt, PASSWORD_DEFAULT);
+
+        $stmt = $pdo->prepare(
+            "INSERT INTO config (setting_key, setting_value) VALUES (?, ?)
+             ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)"
+        );
+
+        $stmt->execute(['admin_username', $setupUsername]);
+        $stmt->execute(['admin_password_hash', $passwordHash]);
+        $stmt->execute(['admin_password_salt', $salt]);
+
+        $_SESSION['is_admin_authenticated'] = true;
+        $_SESSION['admin_username'] = $setupUsername;
+        $_SESSION['flash_message'] = 'Admin account setup complete.';
+        $_SESSION['flash_type'] = 'success';
+    }
+
+    header('Location: index.php');
+    exit;
+}
+
+if ($isAdminConfigured && isset($_POST['admin_login'])) {
+    $loginUsername = trim((string)($_POST['admin_username'] ?? ''));
+    $loginPassword = (string)($_POST['admin_password'] ?? '');
+    $isValidLogin = hash_equals($adminUsername, $loginUsername) && password_verify($loginPassword . $adminPasswordSalt, $adminPasswordHash);
+
+    if ($isValidLogin) {
+        session_regenerate_id(true);
+        $_SESSION['is_admin_authenticated'] = true;
+        $_SESSION['admin_username'] = $adminUsername;
+        $_SESSION['flash_message'] = 'Signed in successfully.';
+        $_SESSION['flash_type'] = 'success';
+    } else {
+        $_SESSION['auth_flash_message'] = 'Invalid username or password.';
+        $_SESSION['auth_flash_type'] = 'error';
+    }
+
+    header('Location: index.php');
+    exit;
+}
+
+if (!$isAdminConfigured || empty($_SESSION['is_admin_authenticated'])) {
+    $authFlashMessage = $_SESSION['auth_flash_message'] ?? '';
+    $authFlashType = $_SESSION['auth_flash_type'] ?? 'error';
+    unset($_SESSION['auth_flash_message'], $_SESSION['auth_flash_type']);
+    ?>
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Uptime Dashboard Access</title>
+    <link rel="stylesheet" href="styles.css">
+    <script defer src="app.js"></script>
+</head>
+<body class="auth-page">
+    <div class="auth-shell">
+        <?php if ($authFlashMessage): ?>
+            <div class="flash <?= htmlspecialchars($authFlashType) ?>"><?= htmlspecialchars($authFlashMessage) ?></div>
+        <?php endif; ?>
+
+        <?php if (!$isAdminConfigured): ?>
+            <h1>Create Admin Account</h1>
+            <p>Set up your admin username and password to secure this dashboard.</p>
+            <form method="POST">
+                <div class="field">
+                    <label for="setup_username">Admin Username</label>
+                    <input type="text" id="setup_username" name="setup_username" minlength="3" required>
+                </div>
+                <div class="field">
+                    <label for="setup_password">Admin Password</label>
+                    <input type="password" id="setup_password" name="setup_password" minlength="8" title="Use 8 or more characters with at least one letter and one number" required>
+                </div>
+                <div class="field">
+                    <label for="setup_password_confirm">Confirm Password</label>
+                    <input type="password" id="setup_password_confirm" name="setup_password_confirm" minlength="8" required>
+                </div>
+                <button type="submit" name="setup_admin">Create Admin Account</button>
+            </form>
+            <div class="hint">Use 8 or more characters with at least one letter and one number. Passwords are salted and hashed before being stored in the database.</div>
+        <?php else: ?>
+            <h1>Admin Login</h1>
+            <p>Sign in to access uptime settings and controls.</p>
+            <form method="POST">
+                <div class="field">
+                    <label for="admin_username">Username</label>
+                    <input type="text" id="admin_username" name="admin_username" autocomplete="username" required>
+                </div>
+                <div class="field">
+                    <label for="admin_password">Password</label>
+                    <input type="password" id="admin_password" name="admin_password" autocomplete="current-password" required>
+                </div>
+                <button type="submit" name="admin_login">Sign In</button>
+            </form>
+        <?php endif; ?>
+    </div>
+</body>
+</html>
+<?php
+    exit;
 }
 
 // --- Actions ---
@@ -34,7 +248,9 @@ if (isset($_POST['ping_site'])) {
     $site = $stmt->fetch();
 
     if ($site) {
-        pingSite($pdo, $site['id'], $site['url'], $site['alias']);
+        $timeout = (int)($site['timeout_seconds'] ?? $defaultTimeout);
+        $retries = (int)($site['retries'] ?? $defaultRetries);
+        pingSite($pdo, $site['id'], $site['url'], $site['alias'], $timeout, $retries);
     }
 
     header('Location: index.php');
@@ -42,10 +258,28 @@ if (isset($_POST['ping_site'])) {
 }
 
 if (isset($_POST['add_site'])) {
-    $stmt = $pdo->prepare("INSERT INTO sites (url, alias) VALUES (?, ?)");
-    $stmt->execute([$_POST['url'], $_POST['alias']]);
+    $timeout = max(1, (int)($_POST['timeout_seconds'] ?? $defaultTimeout));
+    $retries = max(0, (int)($_POST['retries'] ?? $defaultRetries));
+    
+    $stmt = $pdo->prepare("INSERT INTO sites (url, alias, timeout_seconds, retries) VALUES (?, ?, ?, ?)");
+    $stmt->execute([$_POST['url'], $_POST['alias'], $timeout, $retries]);
     $newId = $pdo->lastInsertId();
-    pingSite($pdo, $newId, $_POST['url'], $_POST['alias']); // Instant check
+    
+    pingSite($pdo, $newId, $_POST['url'], $_POST['alias'], $timeout, $retries); // Instant check
+}
+
+if (isset($_POST['update_site_settings'])) {
+    $siteId = (int)$_POST['site_id'];
+    $timeout = max(1, (int)$_POST['timeout_seconds']);
+    $retries = max(0, (int)$_POST['retries']);
+    
+    $pdo->prepare("UPDATE sites SET timeout_seconds = ?, retries = ? WHERE id = ?")
+        ->execute([$timeout, $retries, $siteId]);
+    
+    $_SESSION['flash_message'] = 'Site settings updated successfully.';
+    $_SESSION['flash_type'] = 'success';
+    header('Location: index.php');
+    exit;
 }
 
 if (isset($_POST['clear_logs'])) {
@@ -57,10 +291,31 @@ if (isset($_POST['clear_logs'])) {
     }
 }
 
-if (isset($_POST['save_settings'])) {
+if (isset($_POST['save_monitoring_settings']) || isset($_POST['save_settings'])) {
     $settings = [
         'quiet_start_hour' => (int)$_POST['quiet_start_hour'],
         'quiet_end_hour' => (int)$_POST['quiet_end_hour'],
+        'default_timeout' => max(1, (int)$_POST['default_timeout']),
+        'default_retries' => max(0, (int)$_POST['default_retries']),
+    ];
+
+    $stmt = $pdo->prepare(
+        "INSERT INTO config (setting_key, setting_value) VALUES (?, ?)
+         ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)"
+    );
+
+    foreach ($settings as $key => $value) {
+        $stmt->execute([$key, (string)$value]);
+    }
+
+    $_SESSION['flash_message'] = 'Monitoring settings saved successfully.';
+    $_SESSION['flash_type'] = 'success';
+    header('Location: index.php');
+    exit;
+}
+
+if (isset($_POST['save_telegram_settings'])) {
+    $settings = [
         'telegram_bot_token' => trim($_POST['telegram_bot_token']),
         'telegram_chat_id' => trim($_POST['telegram_chat_id']),
     ];
@@ -74,14 +329,84 @@ if (isset($_POST['save_settings'])) {
         $stmt->execute([$key, (string)$value]);
     }
 
+    $_SESSION['flash_message'] = 'Telegram settings saved successfully.';
+    $_SESSION['flash_type'] = 'success';
     header('Location: index.php');
     exit;
 }
 
-// JSON Endpoint for Chart Data
+if (isset($_POST['test_telegram'])) {
+    $telegramBotTokenInput = trim($_POST['telegram_bot_token'] ?? '');
+    $telegramChatIdInput = trim($_POST['telegram_chat_id'] ?? '');
+    $currentConfig = $pdo->query("SELECT setting_key, setting_value FROM config")->fetchAll(PDO::FETCH_KEY_PAIR);
+
+    $telegramBotToken = $telegramBotTokenInput !== '' ? $telegramBotTokenInput : ($currentConfig['telegram_bot_token'] ?? '');
+    $telegramChatId = $telegramChatIdInput !== '' ? $telegramChatIdInput : ($currentConfig['telegram_chat_id'] ?? '');
+
+    if ($telegramBotToken === '' || $telegramChatId === '') {
+        $_SESSION['flash_message'] = 'Telegram token and chat id are required for a test message.';
+        $_SESSION['flash_type'] = 'error';
+    } else {
+        $verification = verifyTelegramSettings($telegramBotToken, $telegramChatId);
+
+        if (!$verification['ok']) {
+            $details = $verification['description'] ?: ($verification['response'] ?: 'Unknown Telegram verification failure.');
+            $_SESSION['flash_message'] = "Telegram verification failed: {$details}";
+            $_SESSION['flash_type'] = 'error';
+        } else {
+            $telegramResult = sendTelegramMessage($telegramBotToken, $telegramChatId, 'Test message from Uptime Dashboard: Telegram alerts are configured correctly.');
+
+            if ($telegramResult['ok']) {
+                $httpStatus = $telegramResult['http_code'] ? "HTTP {$telegramResult['http_code']}" : 'no HTTP status';
+                $_SESSION['flash_message'] = "Telegram settings verified and test message sent successfully ({$httpStatus}).";
+                $_SESSION['flash_type'] = 'success';
+            } else {
+                $errorDetails = $telegramResult['description'] ?: ($telegramResult['response'] ?: 'No response from Telegram API.');
+                $_SESSION['flash_message'] = "Telegram settings verified, but the test message failed: {$errorDetails}";
+                $_SESSION['flash_type'] = 'error';
+            }
+        }
+    }
+
+    header('Location: index.php');
+    exit;
+}
+
+if (isset($_POST['verify_telegram'])) {
+    $telegramBotTokenInput = trim($_POST['telegram_bot_token'] ?? '');
+    $telegramChatIdInput = trim($_POST['telegram_chat_id'] ?? '');
+    $currentConfig = $pdo->query("SELECT setting_key, setting_value FROM config")->fetchAll(PDO::FETCH_KEY_PAIR);
+
+    $telegramBotToken = $telegramBotTokenInput !== '' ? $telegramBotTokenInput : ($currentConfig['telegram_bot_token'] ?? '');
+    $telegramChatId = $telegramChatIdInput !== '' ? $telegramChatIdInput : ($currentConfig['telegram_chat_id'] ?? '');
+
+    if ($telegramBotToken === '' || $telegramChatId === '') {
+        $_SESSION['flash_message'] = 'Telegram token and chat id are required to verify settings.';
+        $_SESSION['flash_type'] = 'error';
+    } else {
+        $verification = verifyTelegramSettings($telegramBotToken, $telegramChatId);
+
+        if ($verification['ok']) {
+            $_SESSION['flash_message'] = 'Telegram settings verified successfully.';
+            $_SESSION['flash_type'] = 'success';
+        } else {
+            $details = $verification['description'] ?: ($verification['response'] ?: 'Unknown Telegram verification failure.');
+            $_SESSION['flash_message'] = "Telegram settings verification failed: {$details}";
+            $_SESSION['flash_type'] = 'error';
+        }
+    }
+
+    header('Location: index.php');
+    exit;
+}
+
+// JSON Endpoint for Chart Data (includes cumulative time and health status)
 if (isset($_GET['get_stats'])) {
     header('Content-Type: application/json');
-    $stmt = $pdo->prepare("SELECT response_time, checked_at FROM logs WHERE site_id = ? ORDER BY checked_at DESC LIMIT 50");
+    $stmt = $pdo->prepare(
+        "SELECT cumulative_time, health_status, total_attempts, checked_at FROM logs 
+         WHERE site_id = ? ORDER BY checked_at DESC LIMIT 50"
+    );
     $stmt->execute([$_GET['get_stats']]);
     echo json_encode(array_reverse($stmt->fetchAll()));
     exit;
@@ -95,63 +420,60 @@ $quietStartHour = (int)($config['quiet_start_hour'] ?? $config['active_end_hour'
 $quietEndHour = (int)($config['quiet_end_hour'] ?? $config['active_start_hour'] ?? 8);
 $telegramBotToken = $config['telegram_bot_token'] ?? '';
 $telegramChatId = $config['telegram_chat_id'] ?? '';
+$flashMessage = $_SESSION['flash_message'] ?? '';
+ $flashType = $_SESSION['flash_type'] ?? 'success';
+unset($_SESSION['flash_message']);
+unset($_SESSION['flash_type']);
 ?>
 
 <!DOCTYPE html>
 <html>
 <head>
     <title>Uptime Dashboard</title>
+    <link rel="stylesheet" href="styles.css">
     <script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>
-    <style>
-        :root { color-scheme: light; }
-        body { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; color: #0f172a; background: radial-gradient(circle at top, #eef2ff 0%, #f8fafc 32%, #e2e8f0 100%); }
-        .container { max-width: 1120px; margin: 0 auto; padding: 32px 20px 48px; }
-        .hero { margin-bottom: 24px; }
-        .hero h1 { margin: 0 0 6px; font-size: clamp(2rem, 3vw, 3rem); letter-spacing: -0.04em; }
-        .hero p { margin: 0; color: #475569; }
-        .card { background: rgba(255, 255, 255, 0.88); backdrop-filter: blur(10px); border: 1px solid rgba(148, 163, 184, 0.18); padding: 22px; border-radius: 20px; box-shadow: 0 18px 45px rgba(15, 23, 42, 0.08); margin-bottom: 22px; }
-        table { width: 100%; border-collapse: collapse; }
-        th { font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.08em; color: #64748b; text-align: left; padding: 0 12px 12px; }
-        td { padding: 14px 12px; border-top: 1px solid #e2e8f0; vertical-align: middle; }
-        .status { display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; border-radius: 999px; font-size: 0.8rem; font-weight: 700; }
-        .up { background: #dcfce7; color: #166534; }
-        .down { background: #fee2e2; color: #991b1b; }
-        .actions { display: flex; gap: 8px; flex-wrap: wrap; }
-        button, .btn-link { border: none; border-radius: 999px; padding: 10px 14px; font-weight: 700; cursor: pointer; transition: transform 0.15s ease, box-shadow 0.15s ease, background 0.15s ease; }
-        button:hover, .btn-link:hover { transform: translateY(-1px); }
-        .btn-primary { background: linear-gradient(135deg, #2563eb, #1d4ed8); color: white; box-shadow: 0 10px 24px rgba(37, 99, 235, 0.24); }
-        .btn-secondary { background: #e2e8f0; color: #0f172a; }
-        .btn-danger { background: linear-gradient(135deg, #ef4444, #dc2626); color: white; box-shadow: 0 10px 24px rgba(220, 38, 38, 0.18); }
-        .btn-mini { padding: 9px 12px; font-size: 0.9rem; }
-        form.inline { display: inline; }
-        input, select { border: 1px solid #cbd5e1; border-radius: 12px; padding: 11px 12px; font-size: 1rem; background: white; }
-        form.stack { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
-        .empty-state { color: #64748b; }
-        .chart-wrap { height: 360px; }
-        .modal { display: none; position: fixed; inset: 0; z-index: 1000; background: rgba(15, 23, 42, 0.62); align-items: center; justify-content: center; padding: 18px; }
-        .modal.is-open { display: flex; }
-        .modal-content { width: min(920px, 100%); background: white; border-radius: 24px; padding: 22px; box-shadow: 0 28px 70px rgba(15, 23, 42, 0.3); position: relative; }
-        .modal-close { position: absolute; right: 14px; top: 14px; width: 38px; height: 38px; border-radius: 999px; background: #fee2e2; color: #b91c1c; border: none; font-size: 20px; font-weight: 800; cursor: pointer; }
-        .modal-close:hover { background: #fecaca; }
-        .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 18px; }
-        .modal-lead { margin: 0 0 10px; color: #475569; }
-    </style>
+    <script defer src="app.js"></script>
 </head>
-<body>
+<body class="dashboard-page">
     <div class="container">
         <div class="hero">
             <h1>Uptime Dashboard</h1>
             <p>Track checks, inspect trends, ping on demand, and clean up sites without leaving the page.</p>
+            <div style="margin-top: 12px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+                <span style="color: #cbd5e1; font-weight: 700;">Signed in as <?= htmlspecialchars((string)($_SESSION['admin_username'] ?? 'admin')) ?></span>
+                <form method="POST" class="inline">
+                    <button type="submit" name="admin_logout" class="btn-secondary btn-mini">Logout</button>
+                </form>
+            </div>
         </div>
+
+        <?php if ($flashMessage): ?>
+            <div class="flash <?= htmlspecialchars($flashType) ?>"><?= htmlspecialchars($flashMessage) ?></div>
+        <?php endif; ?>
 
         <div class="card">
             <h2>Current Status</h2>
             <table>
                 <tr><th>Alias</th><th>Status</th><th>Stats</th><th>Actions</th></tr>
-                <?php foreach ($sites as $s): ?>
+                <?php foreach ($sites as $s): 
+                    $healthStatus = $s['last_health_status'] ?? 'unknown';
+                    if ($healthStatus === 'green') {
+                        $statusColor = 'bg-green';
+                        $statusEmoji = '✅';
+                    } elseif ($healthStatus === 'yellow') {
+                        $statusColor = 'bg-yellow';
+                        $statusEmoji = '🟨';
+                    } elseif ($healthStatus === 'red') {
+                        $statusColor = 'bg-red';
+                        $statusEmoji = '🚨';
+                    } else {
+                        $statusColor = 'bg-gray';
+                        $statusEmoji = '❓';
+                    }
+                ?>
                 <tr>
                     <td><strong><?= htmlspecialchars($s['alias']) ?></strong></td>
-                    <td><span class="status <?= ($s['last_status'] < 400 && $s['last_status'] > 0) ? 'up' : 'down' ?>"><?= $s['last_status'] ?></span></td>
+                    <td><span class="status <?= $statusColor ?>"><?= $statusEmoji ?> <?= htmlspecialchars($healthStatus) ?></span></td>
                     <td><button type="button" class="btn-secondary btn-mini" onclick="showChart(<?= (int)$s['id'] ?>, <?= htmlspecialchars(json_encode($s['alias']), ENT_QUOTES, 'UTF-8') ?>)">View Graph</button></td>
                     <td>
                         <div class="actions">
@@ -159,6 +481,7 @@ $telegramChatId = $config['telegram_chat_id'] ?? '';
                                 <input type="hidden" name="site_id" value="<?= $s['id'] ?>">
                                 <button type="submit" name="ping_site" class="btn-primary btn-mini">Ping Now</button>
                             </form>
+                            <button type="button" class="btn-secondary btn-mini" onclick="openSettingsModal(<?= (int)$s['id'] ?>, <?= htmlspecialchars(json_encode($s['alias']), ENT_QUOTES, 'UTF-8') ?>, <?= (int)($s['timeout_seconds'] ?? $defaultTimeout) ?>, <?= (int)($s['retries'] ?? $defaultRetries) ?>)">Settings</button>
                             <button type="button" class="btn-danger btn-mini" onclick="openDeleteModal(<?= (int)$s['id'] ?>, <?= htmlspecialchars(json_encode($s['alias']), ENT_QUOTES, 'UTF-8') ?>)">Delete</button>
                         </div>
                     </td>
@@ -172,6 +495,8 @@ $telegramChatId = $config['telegram_chat_id'] ?? '';
             <form method="POST" class="stack">
                 <input type="text" name="alias" placeholder="Name" required>
                 <input type="url" name="url" placeholder="https://..." required>
+                <input type="number" name="timeout_seconds" placeholder="Timeout (seconds)" value="<?= $defaultTimeout ?>" min="1" required>
+                <input type="number" name="retries" placeholder="Retries" value="<?= $defaultRetries ?>" min="0" required>
                 <button type="submit" name="add_site" class="btn-primary">Add & Test</button>
             </form>
         </div>
@@ -190,26 +515,50 @@ $telegramChatId = $config['telegram_chat_id'] ?? '';
         </div>
 
         <div class="card">
-            <h3>Alert Settings</h3>
-            <p class="modal-lead">Set quiet time hours and Telegram credentials for downtime alerts.</p>
+            <h3>Monitoring Defaults</h3>
+            <p class="modal-lead">Configure quiet hours and request behavior defaults for new sites.</p>
             <form method="POST" class="stack">
-                <label for="quiet_start_hour">Quiet Time Start</label>
-                <select name="quiet_start_hour" id="quiet_start_hour">
-                    <?php for ($hour = 0; $hour < 24; $hour++): ?>
-                        <option value="<?= $hour ?>" <?= $quietStartHour === $hour ? 'selected' : '' ?>><?= sprintf('%02d:00', $hour) ?></option>
-                    <?php endfor; ?>
-                </select>
+                <div class="field">
+                    <label for="quiet_start_hour">Quiet Time Start</label>
+                    <select name="quiet_start_hour" id="quiet_start_hour">
+                        <?php for ($hour = 0; $hour < 24; $hour++): ?>
+                            <option value="<?= $hour ?>" <?= $quietStartHour === $hour ? 'selected' : '' ?>><?= sprintf('%02d:00', $hour) ?></option>
+                        <?php endfor; ?>
+                    </select>
+                </div>
 
-                <label for="quiet_end_hour">Quiet Time End</label>
-                <select name="quiet_end_hour" id="quiet_end_hour">
-                    <?php for ($hour = 0; $hour < 24; $hour++): ?>
-                        <option value="<?= $hour ?>" <?= $quietEndHour === $hour ? 'selected' : '' ?>><?= sprintf('%02d:00', $hour) ?></option>
-                    <?php endfor; ?>
-                </select>
+                <div class="field">
+                    <label for="quiet_end_hour">Quiet Time End</label>
+                    <select name="quiet_end_hour" id="quiet_end_hour">
+                        <?php for ($hour = 0; $hour < 24; $hour++): ?>
+                            <option value="<?= $hour ?>" <?= $quietEndHour === $hour ? 'selected' : '' ?>><?= sprintf('%02d:00', $hour) ?></option>
+                        <?php endfor; ?>
+                    </select>
+                </div>
 
+                <div class="field">
+                    <label for="default_timeout">Default Request Timeout (seconds)</label>
+                    <input type="number" id="default_timeout" name="default_timeout" value="<?= $defaultTimeout ?>" min="1" required>
+                </div>
+
+                <div class="field">
+                    <label for="default_retries">Default Retries</label>
+                    <input type="number" id="default_retries" name="default_retries" value="<?= $defaultRetries ?>" min="0" required>
+                </div>
+
+                <button type="submit" name="save_monitoring_settings" class="btn-primary">Save Monitoring Settings</button>
+            </form>
+        </div>
+
+        <div class="card">
+            <h3>Telegram Alerts</h3>
+            <p class="modal-lead">Manage Telegram bot credentials and test delivery.</p>
+            <form method="POST" class="stack">
                 <input type="text" name="telegram_bot_token" placeholder="Telegram bot token" value="<?= htmlspecialchars($telegramBotToken) ?>">
                 <input type="text" name="telegram_chat_id" placeholder="Telegram chat id" value="<?= htmlspecialchars($telegramChatId) ?>">
-                <button type="submit" name="save_settings" class="btn-primary">Save Alert Settings</button>
+                <button type="submit" name="save_telegram_settings" class="btn-primary">Save Telegram Settings</button>
+                <button type="submit" name="verify_telegram" class="btn-secondary">Verify Telegram Settings</button>
+                <button type="submit" name="test_telegram" class="btn-secondary">Test Telegram Message</button>
             </form>
         </div>
     </div>
@@ -237,67 +586,107 @@ $telegramChatId = $config['telegram_chat_id'] ?? '';
         </div>
     </div>
 
-    <script>
-    let myChart;
-    function showChart(id, name) {
-        const modal = document.getElementById('chartModal');
-        document.getElementById('modalTitle').innerText = "Response Time (ms) - " + name;
-        fetch('index.php?get_stats=' + id)
-            .then(res => res.json())
-            .then(data => {
-                const labels = data.map(i => new Date(i.checked_at).toLocaleString());
-                const values = data.map(i => Number(i.response_time));
+    <div id="settingsModal" class="modal" role="dialog" aria-modal="true">
+        <div class="modal-content" style="max-width: 520px;">
+            <button class="modal-close" aria-label="Close" onclick="closeSettingsModal()">❌</button>
+            <h3 id="settingsTitle">Site Settings</h3>
+            <form method="POST" id="settingsForm" class="stack">
+                <input type="hidden" name="site_id" id="settingsSiteId">
+                <label for="settingsTimeout">Request Timeout (seconds)</label>
+                <input type="number" id="settingsTimeout" name="timeout_seconds" min="1" required>
+                <label for="settingsRetries">Number of Retries</label>
+                <input type="number" id="settingsRetries" name="retries" min="0" required>
+                <div class="modal-actions">
+                    <button type="button" class="btn-secondary" onclick="closeSettingsModal()">Cancel</button>
+                    <button type="submit" name="update_site_settings" class="btn-primary">Save Settings</button>
+                </div>
+            </form>
+        </div>
+    </div>
 
-                if (myChart) myChart.destroy();
-                document.getElementById('chartContainer').innerHTML = '';
-                myChart = new ApexCharts(document.querySelector('#chartContainer'), {
-                    chart: {
-                        type: 'line',
-                        height: 360,
-                        toolbar: { show: false },
-                        fontFamily: 'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
-                    },
-                    series: [{ name: 'Response time (ms)', data: values }],
-                    stroke: { curve: 'smooth', width: 3 },
-                    colors: ['#2563eb'],
-                    grid: { borderColor: '#e2e8f0' },
-                    xaxis: { categories: labels, labels: { rotate: -45, hideOverlappingLabels: true } },
-                    yaxis: { labels: { formatter: (value) => Math.round(value) } },
-                    tooltip: { y: { formatter: (value) => `${value} ms` } }
-                });
-                myChart.render();
-                modal.classList.add('is-open');
-            });
-    }
-
-    function closeChart() {
-        const modal = document.getElementById('chartModal');
-        modal.classList.remove('is-open');
-        if (myChart) { myChart.destroy(); myChart = null; }
-    }
-
-    function openDeleteModal(id, name) {
-        document.getElementById('deleteSiteId').value = id;
-        document.getElementById('deleteMessage').innerText = `This will permanently delete ${name} and all of its logs.`;
-        document.getElementById('deleteModal').classList.add('is-open');
-    }
-
-    function closeDeleteModal() {
-        document.getElementById('deleteModal').classList.remove('is-open');
-    }
-
-    document.getElementById('chartModal').addEventListener('click', function(e) {
-        if (e.target.id === 'chartModal') closeChart();
-    });
-    document.getElementById('deleteModal').addEventListener('click', function(e) {
-        if (e.target.id === 'deleteModal') closeDeleteModal();
-    });
-    document.addEventListener('keydown', function(e) {
-        if (e.key === 'Escape') {
-            closeChart();
-            closeDeleteModal();
-        }
-    });
-    </script>
 </body>
 </html>
+
+<?php
+function sendTelegramMessage($botToken, $chatId, $message) {
+    $url = "https://api.telegram.org/bot{$botToken}/sendMessage";
+    $data = [
+        'chat_id' => $chatId,
+        'text' => $message,
+    ];
+
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => http_build_query($data),
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CONNECTTIMEOUT => 10,
+        CURLOPT_TIMEOUT => 15,
+        CURLOPT_HTTPHEADER => ['Content-Type: application/x-www-form-urlencoded'],
+    ]);
+
+    $response = curl_exec($ch);
+    $curlError = curl_error($ch);
+    $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    $decoded = json_decode($response ?: '', true);
+
+    return [
+        'ok' => $curlError === '' && is_array($decoded) && !empty($decoded['ok']),
+        'http_code' => $httpCode,
+        'response' => $response ?: '',
+        'description' => $curlError !== '' ? $curlError : (is_array($decoded) && isset($decoded['description']) ? $decoded['description'] : ''),
+    ];
+}
+
+function verifyTelegramSettings($botToken, $chatId) {
+    $botInfo = telegramApiRequest($botToken, 'getMe');
+    if (!$botInfo['ok']) {
+        return $botInfo;
+    }
+
+    $chatInfo = telegramApiRequest($botToken, 'getChat', ['chat_id' => $chatId]);
+    if (!$chatInfo['ok']) {
+        return $chatInfo;
+    }
+
+    return [
+        'ok' => true,
+        'http_code' => 200,
+        'response' => '',
+        'description' => '',
+    ];
+}
+
+function telegramApiRequest($botToken, $method, array $payload = []) {
+    $url = "https://api.telegram.org/bot{$botToken}/{$method}";
+
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CONNECTTIMEOUT => 10,
+        CURLOPT_TIMEOUT => 15,
+        CURLOPT_HTTPHEADER => ['Content-Type: application/x-www-form-urlencoded'],
+    ]);
+
+    if (!empty($payload)) {
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($payload));
+    }
+
+    $response = curl_exec($ch);
+    $curlError = curl_error($ch);
+    $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    $decoded = json_decode($response ?: '', true);
+
+    return [
+        'ok' => $curlError === '' && is_array($decoded) && !empty($decoded['ok']),
+        'http_code' => $httpCode,
+        'response' => $response ?: '',
+        'description' => $curlError !== '' ? $curlError : (is_array($decoded) && isset($decoded['description']) ? $decoded['description'] : ''),
+    ];
+}
+?>
