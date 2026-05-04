@@ -57,16 +57,16 @@ function initStarfield() {
             const parallaxY = mouse.active ? (mouse.y - height / 2) * (0.0008 + star.radius * 0.0002) : 0;
             star.x += star.speedX + driftX;
             star.y += star.speedY + driftY;
-            star.twinkle += 0.02 + star.radius * 0.006;
+            star.twinkle += 0.003 + star.radius * 0.0008;
 
             if (star.x > width + 12) star.x = -12;
             if (star.x < -12) star.x = width + 12;
             if (star.y > height + 12) star.y = -12;
             if (star.y < -12) star.y = height + 12;
 
-            const pulse = (Math.sin(star.twinkle) + 1) / 2;
-            const fade = pulse * pulse * (3 - 2 * pulse);
-            const glow = 0.18 + fade * 0.52;
+            const cycle = (star.twinkle % 1);
+            const fade = cycle < 0.5 ? cycle * 2 : (1 - cycle) * 2;
+            const glow = 0.12 + fade * 0.68;
             const size = star.radius * (0.9 + fade * 0.22);
             const x = star.x + parallaxX;
             const y = star.y + parallaxY;
@@ -127,6 +127,75 @@ function initDashboard() {
     }
 
     let myChart;
+    let allChartData = [];
+
+    function filterDataByDays(data, days) {
+        const now = new Date();
+        const cutoffDate = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
+        return data.filter((item) => new Date(item.checked_at) >= cutoffDate);
+    }
+
+    function renderChart(data, name) {
+        const labels = data.map((item) => new Date(item.checked_at).toLocaleString());
+        const values = data.map((item) => Number(item.cumulative_time || item.response_time || 0));
+        const statuses = data.map((item) => item.health_status || 'unknown');
+
+        const greenData = values.map((value, index) => (statuses[index] === 'green' ? value : null));
+        const yellowData = values.map((value, index) => (statuses[index] === 'yellow' ? value : null));
+        const redData = values.map((value, index) => (statuses[index] === 'red' ? value : null));
+
+        if (myChart) {
+            myChart.destroy();
+        }
+
+        const chartContainer = document.getElementById('chartContainer');
+        chartContainer.innerHTML = '';
+        myChart = new ApexCharts(chartContainer, {
+            chart: {
+                type: 'bar',
+                height: 360,
+                toolbar: { show: false },
+                fontFamily: 'Trebuchet MS, Trebuchet, Arial, sans-serif',
+                foreColor: '#e5e7eb',
+                background: 'transparent',
+            },
+            series: [
+                { name: 'Success (ms)', data: greenData },
+                { name: 'Recovered (ms)', data: yellowData },
+                { name: 'Failed (ms)', data: redData },
+            ],
+            colors: ['#34d399', '#fbbf24', '#fb7185'],
+            grid: { borderColor: 'rgba(148, 163, 184, 0.16)' },
+            xaxis: {
+                categories: labels,
+                labels: {
+                    rotate: -45,
+                    hideOverlappingLabels: true,
+                    style: { colors: '#cbd5e1' },
+                },
+            },
+            yaxis: {
+                labels: {
+                    formatter: (value) => Math.round(value),
+                    style: { colors: '#cbd5e1' },
+                },
+            },
+            tooltip: {
+                theme: 'dark',
+                fillSeriesColor: false,
+                style: { fontSize: '12px' },
+                y: {
+                    formatter: (value, { dataPointIndex }) => {
+                        const attempts = data[dataPointIndex]?.total_attempts || 1;
+                        return value ? `${value.toFixed(2)} ms (${attempts} attempt${attempts > 1 ? 's' : ''})` : '—';
+                    },
+                },
+            },
+            legend: { position: 'top' },
+            plotOptions: { bar: { horizontal: false, columnWidth: '55%' } },
+        });
+        myChart.render();
+    }
 
     window.showChart = function showChart(id, name) {
         const modal = document.getElementById('chartModal');
@@ -140,68 +209,51 @@ function initDashboard() {
         fetch('index.php?get_stats=' + id)
             .then((response) => response.json())
             .then((data) => {
-                const labels = data.map((item) => new Date(item.checked_at).toLocaleString());
-                const values = data.map((item) => Number(item.cumulative_time || item.response_time || 0));
-                const statuses = data.map((item) => item.health_status || 'unknown');
-
-                const greenData = values.map((value, index) => (statuses[index] === 'green' ? value : null));
-                const yellowData = values.map((value, index) => (statuses[index] === 'yellow' ? value : null));
-                const redData = values.map((value, index) => (statuses[index] === 'red' ? value : null));
-
-                if (myChart) {
-                    myChart.destroy();
-                }
-
-                chartContainer.innerHTML = '';
-                myChart = new ApexCharts(chartContainer, {
-                    chart: {
-                        type: 'line',
-                        height: 360,
-                        toolbar: { show: false },
-                        fontFamily: 'Trebuchet MS, Trebuchet, Arial, sans-serif',
-                        foreColor: '#e5e7eb',
-                        background: 'transparent',
-                    },
-                    series: [
-                        { name: 'Success (ms)', data: greenData },
-                        { name: 'Recovered (ms)', data: yellowData },
-                        { name: 'Failed (ms)', data: redData },
-                    ],
-                    stroke: { curve: 'smooth', width: 3 },
-                    colors: ['#34d399', '#fbbf24', '#fb7185'],
-                    grid: { borderColor: 'rgba(148, 163, 184, 0.16)' },
-                    xaxis: {
-                        categories: labels,
-                        labels: {
-                            rotate: -45,
-                            hideOverlappingLabels: true,
-                            style: { colors: '#cbd5e1' },
-                        },
-                    },
-                    yaxis: {
-                        labels: {
-                            formatter: (value) => Math.round(value),
-                            style: { colors: '#cbd5e1' },
-                        },
-                    },
-                    tooltip: {
-                        theme: 'dark',
-                        fillSeriesColor: false,
-                        style: { fontSize: '12px' },
-                        y: {
-                            formatter: (value, { dataPointIndex }) => {
-                                const attempts = data[dataPointIndex]?.total_attempts || 1;
-                                return value ? `${value.toFixed(2)} ms (${attempts} attempt${attempts > 1 ? 's' : ''})` : '—';
-                            },
-                        },
-                    },
-                    legend: { position: 'top' },
-                    plotOptions: { scatter: { size: 8 } },
-                });
-                myChart.render();
+                allChartData = data;
+                renderChart(data, name);
                 modal.classList.add('is-open');
+                setupChartTimeRangeButtons();
             });
     };
+
+    function setupChartTimeRangeButtons() {
+        let existingButtons = document.getElementById('chartTimeRangeButtons');
+        if (existingButtons) {
+            existingButtons.remove();
+        }
+
+        const modalContent = document.querySelector('#chartModal .modal-content');
+        const buttonContainer = document.createElement('div');
+        buttonContainer.id = 'chartTimeRangeButtons';
+        buttonContainer.style.cssText = 'display: flex; gap: 8px; margin-bottom: 16px; justify-content: center;';
+
+        const ranges = [
+            { label: '1D', days: 1 },
+            { label: '7D', days: 7 },
+            { label: '30D', days: 30 },
+        ];
+
+        ranges.forEach((range) => {
+            const button = document.createElement('button');
+            button.className = 'btn-secondary';
+            button.textContent = range.label;
+            button.style.cssText = 'padding: 8px 16px; font-size: 0.9rem;';
+            button.onclick = () => {
+                const filtered = filterDataByDays(allChartData, range.days);
+                renderChart(filtered, '');
+                document.querySelectorAll('#chartTimeRangeButtons button').forEach((btn) => {
+                    btn.style.background = 'rgba(148, 163, 184, 0.12)';
+                });
+                button.style.background = 'rgba(34, 211, 238, 0.24)';
+            };
+            buttonContainer.appendChild(button);
+        });
+
+        modalContent.insertBefore(buttonContainer, modalContent.querySelector('.chart-wrap'));
+        document.querySelectorAll('#chartTimeRangeButtons button')[0].style.background = 'rgba(34, 211, 238, 0.24)';
+        const filtered = filterDataByDays(allChartData, 1);
+        renderChart(filtered, '');
+    }
 
     window.closeChart = function closeChart() {
         const modal = document.getElementById('chartModal');
@@ -211,6 +263,11 @@ function initDashboard() {
         if (myChart) {
             myChart.destroy();
             myChart = null;
+        }
+        allChartData = [];
+        const buttonContainer = document.getElementById('chartTimeRangeButtons');
+        if (buttonContainer) {
+            buttonContainer.remove();
         }
     };
 

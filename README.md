@@ -58,7 +58,36 @@ Database connection and PHP runtime settings.
 - Creates the PDO connection helper used by the other scripts
 - Enables error reporting for debugging
 
-This file is ignored by git because it typically contains local secrets.
+Create this file locally and add your own database details. It is ignored by git because it contains local secrets.
+
+```php
+<?php
+// Database Credentials
+define('DB_HOST', 'your-db-host');
+define('DB_NAME', 'your-db-name');
+define('DB_USER', 'your-db-user');
+define('DB_PASS', 'your-db-password');
+
+// Error Reporting (Turn off in production if you want)
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+
+function getDbConnection() {
+	$dsn = "mysql:host=" . DB_HOST . ";dbname=" . DB_NAME . ";charset=utf8mb4";
+	try {
+		$pdo = new PDO($dsn, DB_USER, DB_PASS, [
+			PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+			PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+			PDO::ATTR_EMULATE_PREPARES => false,
+		]);
+		return $pdo;
+	} catch (PDOException $e) {
+		die("Database connection failed: " . $e->getMessage());
+	}
+}
+```
+
+Make sure the file exists at the project root as `config.php` before running the dashboard.
 
 ### `init.sql`
 Database bootstrap script.

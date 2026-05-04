@@ -137,6 +137,46 @@ function sendTelegram($msg, $config) {
     return $httpCode >= 200 && $httpCode < 300;
 }
 
+function calculateUptimeMetrics($pdo, $siteId) {
+    $pastDay = date('Y-m-d H:i:s', time() - 86400);
+    
+    // Get all logs from the past 24 hours
+    $stmt = $pdo->prepare(
+        "SELECT health_status FROM logs WHERE site_id = ? AND checked_at > ? ORDER BY checked_at ASC"
+    );
+    $stmt->execute([$siteId, $pastDay]);
+    $logs = $stmt->fetchAll();
+
+    if (empty($logs)) {
+        return ['uptime' => 0, 'outages' => 0];
+    }
+
+    $totalChecks = count($logs);
+    $successfulChecks = 0;
+    $outageCount = 0;
+    $inOutage = false;
+
+    foreach ($logs as $log) {
+        if ($log['health_status'] === 'green') {
+            $successfulChecks++;
+            if ($inOutage) {
+                $inOutage = false;
+            }
+        } elseif ($log['health_status'] === 'red') {
+            if (!$inOutage) {
+                $outageCount++;
+                $inOutage = true;
+            }
+        } elseif ($log['health_status'] === 'yellow') {
+            $successfulChecks++;
+        }
+    }
+
+    $uptime = $totalChecks > 0 ? round(($successfulChecks / $totalChecks) * 100, 2) : 0;
+
+    return ['uptime' => $uptime, 'outages' => $outageCount];
+}
+
 // Set Timezone and check Quiet Time
 date_default_timezone_set($config['timezone'] ?? 'UTC');
 $currentHour = (int)date('H');
@@ -215,7 +255,12 @@ foreach ($sites as $site) {
 if (!$isQuietTime) {
     $pending = $pdo->query("SELECT * FROM sites WHERE pending_alert = 1")->fetchAll();
     foreach ($pending as $site) {
-        sendTelegram("🌅 Morning Catch-up: {$site['alias']} is still DOWN (Status: {$site['last_status']})", $config);
+        $metrics = calculateUptimeMetrics($pdo, $site['id']);
+        $uptimePercent = $metrics['uptime'];
+        $outageCount = $metrics['outages'];
+        $message = "🌅 Morning Catch-up: {$site['alias']} is still DOWN (Status: {$site['last_status']})\n";
+        $message .= "📊 Last 24h: {$uptimePercent}% uptime | {$outageCount} outage" . ($outageCount !== 1 ? 's' : '');
+        sendTelegram($message, $config);
         $pdo->prepare("UPDATE sites SET pending_alert = 0 WHERE id = ?")->execute([$site['id']]);
     }
 }
