@@ -95,6 +95,8 @@ function pingSite($pdo, $id, $url, $alias, $timeout = 30, $retries = 2) {
     
     $pdo->prepare("UPDATE sites SET last_status = ?, last_health_status = ? WHERE id = ?")
         ->execute([$result['status_code'], $result['health_status'], $id]);
+
+    return $result;
 }
 
 // Load config defaults
@@ -241,6 +243,60 @@ if (isset($_POST['delete_site'])) {
     exit;
 }
 
+if (isset($_POST['toggle_morning_summary'])) {
+    $siteId = (int)$_POST['site_id'];
+    $enabled = isset($_POST['morning_summary_enabled']) ? (int)$_POST['morning_summary_enabled'] : 0;
+    $enabled = $enabled === 1 ? 1 : 0;
+
+    $pdo->prepare("UPDATE sites SET morning_summary_enabled = ? WHERE id = ?")
+        ->execute([$enabled, $siteId]);
+
+    $_SESSION['flash_message'] = $enabled === 1
+        ? 'Morning summary alerts enabled for this site.'
+        : 'Morning summary alerts disabled for this site.';
+    $_SESSION['flash_type'] = 'success';
+    header('Location: index.php');
+    exit;
+}
+
+if (isset($_POST['send_summary'])) {
+    $siteId = (int)$_POST['site_id'];
+    $stmt = $pdo->prepare("SELECT * FROM sites WHERE id = ?");
+    $stmt->execute([$siteId]);
+    $site = $stmt->fetch();
+
+    if ($site) {
+        $timeout = (int)($site['timeout_seconds'] ?? $defaultTimeout);
+        $retries = (int)($site['retries'] ?? $defaultRetries);
+        $today = (new DateTimeImmutable('now', new DateTimeZone($configDefaults['timezone'] ?? 'UTC')))->format('Y-m-d');
+        $result = pingSite($pdo, $site['id'], $site['url'], $site['alias'], $timeout, $retries);
+        $metrics = calculateSiteSummaryMetrics($pdo, (int)$site['id'], 1);
+        $message = buildMorningDigestMessage($site, $metrics, $result);
+        $telegramBotToken = (string)($configDefaults['telegram_bot_token'] ?? '');
+        $telegramChatId = (string)($configDefaults['telegram_chat_id'] ?? '');
+
+        if ($telegramBotToken === '' || $telegramChatId === '') {
+            $_SESSION['flash_message'] = 'Telegram token and chat id are required to send a summary.';
+            $_SESSION['flash_type'] = 'error';
+        } else {
+            $telegramResult = sendTelegramMessage($telegramBotToken, $telegramChatId, $message);
+
+            if ($telegramResult['ok']) {
+                $pdo->prepare("UPDATE sites SET last_morning_summary_sent = ? WHERE id = ?")
+                    ->execute([$today, $site['id']]);
+                $_SESSION['flash_message'] = 'Summary sent successfully.';
+                $_SESSION['flash_type'] = 'success';
+            } else {
+                $_SESSION['flash_message'] = 'Summary could not be sent to Telegram.';
+                $_SESSION['flash_type'] = 'error';
+            }
+        }
+    }
+
+    header('Location: index.php');
+    exit;
+}
+
 if (isset($_POST['ping_site'])) {
     $siteId = (int)$_POST['site_id'];
     $stmt = $pdo->prepare("SELECT * FROM sites WHERE id = ?");
@@ -261,7 +317,7 @@ if (isset($_POST['add_site'])) {
     $timeout = max(1, (int)($_POST['timeout_seconds'] ?? $defaultTimeout));
     $retries = max(0, (int)($_POST['retries'] ?? $defaultRetries));
     
-    $stmt = $pdo->prepare("INSERT INTO sites (url, alias, timeout_seconds, retries) VALUES (?, ?, ?, ?)");
+    $stmt = $pdo->prepare("INSERT INTO sites (url, alias, timeout_seconds, retries, morning_summary_enabled) VALUES (?, ?, ?, ?, 0)");
     $stmt->execute([$_POST['url'], $_POST['alias'], $timeout, $retries]);
     $newId = $pdo->lastInsertId();
     
@@ -403,13 +459,78 @@ if (isset($_POST['verify_telegram'])) {
 // JSON Endpoint for Chart Data (includes cumulative time and health status)
 if (isset($_GET['get_stats'])) {
     header('Content-Type: application/json');
+    $configRows = $pdo->query("SELECT setting_key, setting_value FROM config")->fetchAll(PDO::FETCH_KEY_PAIR);
+    $serverTimezone = new DateTimeZone($configRows['timezone'] ?? 'UTC');
     $stmt = $pdo->prepare(
         "SELECT cumulative_time, health_status, total_attempts, checked_at FROM logs 
          WHERE site_id = ? ORDER BY checked_at DESC LIMIT 50"
     );
     $stmt->execute([$_GET['get_stats']]);
-    echo json_encode(array_reverse($stmt->fetchAll()));
+    $rows = array_reverse($stmt->fetchAll());
+    foreach ($rows as &$row) {
+        $checkedAt = DateTimeImmutable::createFromFormat('Y-m-d H:i:s', $row['checked_at'], $serverTimezone);
+        if ($checkedAt instanceof DateTimeImmutable) {
+            $row['checked_at_ms'] = $checkedAt->getTimestamp() * 1000;
+        } else {
+            $row['checked_at_ms'] = strtotime((string)$row['checked_at']) * 1000;
+        }
+    }
+    unset($row);
+    echo json_encode($rows);
     exit;
+}
+
+function calculateSiteSummaryMetrics(PDO $pdo, int $siteId, int $days): array {
+    $cutoff = date('Y-m-d H:i:s', time() - ($days * 86400));
+    $stmt = $pdo->prepare(
+        "SELECT health_status FROM logs WHERE site_id = ? AND checked_at > ? ORDER BY checked_at ASC"
+    );
+    $stmt->execute([$siteId, $cutoff]);
+    $logs = $stmt->fetchAll();
+
+    if (empty($logs)) {
+        return ['uptime' => 0, 'outages' => 0];
+    }
+
+    $totalChecks = count($logs);
+    $successfulChecks = 0;
+    $outageCount = 0;
+    $inOutage = false;
+
+    foreach ($logs as $log) {
+        if ($log['health_status'] === 'green' || $log['health_status'] === 'yellow') {
+            $successfulChecks++;
+            $inOutage = false;
+            continue;
+        }
+
+        if ($log['health_status'] === 'red' && !$inOutage) {
+            $outageCount++;
+            $inOutage = true;
+        }
+    }
+
+    return [
+        'uptime' => $totalChecks > 0 ? round(($successfulChecks / $totalChecks) * 100, 2) : 0,
+        'outages' => $outageCount,
+    ];
+}
+
+function buildMorningDigestMessage(array $site, array $metrics, array $result): string {
+    $uptimePercent = number_format((float)$metrics['uptime'], 2);
+    $outageCount = (int)$metrics['outages'];
+
+    if (($result['health_status'] ?? '') === 'red') {
+        $message = "🌅 Morning Catch-up: {$site['alias']} is still DOWN (Status: {$result['status_code']})\n";
+    } elseif (($result['health_status'] ?? '') === 'yellow') {
+        $message = "🌅 Morning Summary: {$site['alias']} recovered after retries.\n";
+    } else {
+        $message = "🌅 Morning Summary: {$site['alias']} is UP.\n";
+    }
+
+    $message .= "📊 Last 24h: {$uptimePercent}% uptime | {$outageCount} outage" . ($outageCount !== 1 ? 's' : '');
+
+    return $message;
 }
 
 // ... (Rest of login/setup logic from previous version) ...
@@ -420,6 +541,7 @@ $quietStartHour = (int)($config['quiet_start_hour'] ?? $config['active_end_hour'
 $quietEndHour = (int)($config['quiet_end_hour'] ?? $config['active_start_hour'] ?? 8);
 $telegramBotToken = $config['telegram_bot_token'] ?? '';
 $telegramChatId = $config['telegram_chat_id'] ?? '';
+$dashboardTimezone = $config['timezone'] ?? 'UTC';
 $flashMessage = $_SESSION['flash_message'] ?? '';
  $flashType = $_SESSION['flash_type'] ?? 'success';
 unset($_SESSION['flash_message']);
@@ -429,8 +551,9 @@ unset($_SESSION['flash_type']);
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Uptime Dashboard</title>
+    <title>Boomarian Uptime Dashboard</title>
     <link rel="stylesheet" href="styles.css">
+    <script>window.UPTIME_TIMEZONE = <?= json_encode($dashboardTimezone) ?>;</script>
     <script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>
     <script defer src="app.js"></script>
 </head>
@@ -454,9 +577,12 @@ unset($_SESSION['flash_type']);
         <div class="card">
             <h2>Current Status</h2>
             <table>
-                <tr><th>Alias</th><th>Status</th><th>Stats</th><th>Actions</th></tr>
+                <tr><th>Morning Summary</th><th>Alias</th><th>Status</th><th>Summary</th><th>Actions</th></tr>
                 <?php foreach ($sites as $s): 
                     $healthStatus = $s['last_health_status'] ?? 'unknown';
+                    $summaryEnabled = (int)($s['morning_summary_enabled'] ?? 0) === 1;
+                    $summary1d = calculateSiteSummaryMetrics($pdo, (int)$s['id'], 1);
+                    $summary30d = calculateSiteSummaryMetrics($pdo, (int)$s['id'], 30);
                     if ($healthStatus === 'green') {
                         $statusColor = 'bg-green';
                         $statusEmoji = '✅';
@@ -472,9 +598,28 @@ unset($_SESSION['flash_type']);
                     }
                 ?>
                 <tr>
+                    <td>
+                        <div class="actions">
+                            <form method="POST" class="inline">
+                                <input type="hidden" name="site_id" value="<?= $s['id'] ?>">
+                                <input type="hidden" name="morning_summary_enabled" value="<?= $summaryEnabled ? 0 : 1 ?>">
+                                <button type="submit" name="toggle_morning_summary" class="btn-secondary btn-mini"><?= $summaryEnabled ? 'Disable Summary' : 'Enable Summary' ?></button>
+                            </form>
+                            <form method="POST" class="inline">
+                                <input type="hidden" name="site_id" value="<?= $s['id'] ?>">
+                                <button type="submit" name="send_summary" class="btn-secondary btn-mini">Send Summary</button>
+                            </form>
+                        </div>
+                    </td>
                     <td><strong><?= htmlspecialchars($s['alias']) ?></strong></td>
                     <td><span class="status <?= $statusColor ?>"><?= $statusEmoji ?> <?= htmlspecialchars($healthStatus) ?></span></td>
-                    <td><button type="button" class="btn-secondary btn-mini" onclick="showChart(<?= (int)$s['id'] ?>, <?= htmlspecialchars(json_encode($s['alias']), ENT_QUOTES, 'UTF-8') ?>)">View Graph</button></td>
+                    <td>
+                        <div class="site-stats">
+                            <div><strong>1D:</strong> <?= htmlspecialchars(number_format((float)$summary1d['uptime'], 2)) ?>% uptime, <?= (int)$summary1d['outages'] ?> outage<?= $summary1d['outages'] === 1 ? '' : 's' ?></div>
+                            <div><strong>30D:</strong> <?= htmlspecialchars(number_format((float)$summary30d['uptime'], 2)) ?>% uptime, <?= (int)$summary30d['outages'] ?> outage<?= $summary30d['outages'] === 1 ? '' : 's' ?></div>
+                            <button type="button" class="btn-secondary btn-mini" onclick="showChart(<?= (int)$s['id'] ?>, <?= htmlspecialchars(json_encode($s['alias']), ENT_QUOTES, 'UTF-8') ?>)">View Graph</button>
+                        </div>
+                    </td>
                     <td>
                         <div class="actions">
                             <form method="POST" class="inline">
@@ -567,6 +712,18 @@ unset($_SESSION['flash_type']);
         <div class="modal-content">
             <button class="modal-close" aria-label="Close" onclick="closeChart()">❌</button>
             <h3 id="modalTitle"></h3>
+            <script>/* Ensure a safe global exists for inline onclick handlers before app.js loads */
+                if (typeof window.setChartRange !== 'function') {
+                    window.setChartRange = function(days) {
+                        try { document.dispatchEvent(new CustomEvent('uptime-setChartRange', { detail: days })); } catch (e) { /* ignore */ }
+                    };
+                }
+            </script>
+            <div id="chartTimeRangeButtons" class="chart-controls" aria-label="Chart time range">
+                <button type="button" class="btn-secondary chart-range-button is-active" data-days="1" onclick="setChartRange(1)">1D</button>
+                <button type="button" class="btn-secondary chart-range-button" data-days="7" onclick="setChartRange(7)">7D</button>
+                <button type="button" class="btn-secondary chart-range-button" data-days="30" onclick="setChartRange(30)">30D</button>
+            </div>
             <div id="chartContainer" class="chart-wrap"></div>
         </div>
     </div>

@@ -1,3 +1,11 @@
+// Provide a safe global function for inline onclick handlers.
+// It will dispatch an event that initDashboard listens for, and will be
+// overridden by a richer implementation once the dashboard initializes.
+function setChartRange(days) {
+    try { document.dispatchEvent(new CustomEvent('uptime-setChartRange', { detail: days })); } catch (e) { /* ignore */ }
+}
+window.setChartRange = setChartRange;
+
 document.addEventListener('DOMContentLoaded', () => {
     initStarfield();
     initDashboard();
@@ -122,79 +130,187 @@ function initStarfield() {
 
 function initDashboard() {
     const chartModal = document.getElementById('chartModal');
-    if (!chartModal || typeof ApexCharts === 'undefined') {
+    if (!chartModal) {
         return;
     }
 
     let myChart;
     let allChartData = [];
+    let activeChartDays = 1;
 
     function filterDataByDays(data, days) {
         const now = new Date();
         const cutoffDate = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
-        return data.filter((item) => new Date(item.checked_at) >= cutoffDate);
+        return data.filter((item) => getCheckedAtMs(item) >= cutoffDate.getTime());
     }
 
-    function renderChart(data, name) {
-        const labels = data.map((item) => new Date(item.checked_at).toLocaleString());
-        const values = data.map((item) => Number(item.cumulative_time || item.response_time || 0));
-        const statuses = data.map((item) => item.health_status || 'unknown');
+    function getServerTimezone() {
+        return window.UPTIME_TIMEZONE || 'UTC';
+    }
 
-        const greenData = values.map((value, index) => (statuses[index] === 'green' ? value : null));
-        const yellowData = values.map((value, index) => (statuses[index] === 'yellow' ? value : null));
-        const redData = values.map((value, index) => (statuses[index] === 'red' ? value : null));
-
-        if (myChart) {
-            myChart.destroy();
+    function getCheckedAtMs(item) {
+        if (Number.isFinite(Number(item.checked_at_ms))) {
+            return Number(item.checked_at_ms);
         }
 
+        const parsed = Date.parse(item.checked_at);
+        return Number.isFinite(parsed) ? parsed : 0;
+    }
+
+    function formatChartTime(timestamp) {
+        if (!Number.isFinite(Number(timestamp))) {
+            return '';
+        }
+
+        try {
+            return new Intl.DateTimeFormat('en-US', {
+                timeZone: getServerTimezone(),
+                month: 'short',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+            }).format(new Date(Number(timestamp)));
+        } catch (e) {
+            return new Date(Number(timestamp)).toLocaleString();
+        }
+    }
+
+    function updateChartRangeButtons(days) {
+        document.querySelectorAll('#chartTimeRangeButtons .chart-range-button').forEach((button) => {
+            button.classList.toggle('is-active', Number(button.dataset.days) === days);
+        });
+    }
+
+    function renderChartForDays(days) {
+        activeChartDays = days;
+        updateChartRangeButtons(days);
+        renderChart(filterDataByDays(allChartData, days));
+    }
+
+    // Support external callers (inline onclick or other scripts) by listening
+    // for the dispatched custom event from the global setChartRange helper.
+    document.addEventListener('uptime-setChartRange', (ev) => {
+        const days = Number(ev && ev.detail);
+        if (Number.isFinite(days)) {
+            renderChartForDays(days);
+        }
+    });
+
+    // Use ApexCharts for a proper bar chart with datetime x-axis and zoom support.
+    let currentStatuses = [];
+
+    // Override the safe global setChartRange so inline handlers call this implementation.
+    window.setChartRange = function setChartRange(days) {
+        if (!Number.isFinite(days)) {
+            return;
+        }
+        activeChartDays = days;
+        updateChartRangeButtons(days);
+
+        if (!myChart) {
+            // If chart isn't rendered yet, just re-render with filtered data when available
+            renderChart(filterDataByDays(allChartData, days));
+            return;
+        }
+
+        const max = Date.now();
+        const min = max - days * 24 * 60 * 60 * 1000;
+        try {
+            // Prefer zoomX if available
+            if (typeof myChart.zoomX === 'function') {
+                myChart.zoomX(min, max);
+            } else {
+                myChart.updateOptions({ xaxis: { min, max } }, false, false);
+            }
+        } catch (e) {
+            // Fallback: re-render filtered data
+            renderChart(filterDataByDays(allChartData, days));
+        }
+    };
+
+    function renderChart(data) {
         const chartContainer = document.getElementById('chartContainer');
+        if (!chartContainer) {
+            return;
+        }
+
         chartContainer.innerHTML = '';
-        myChart = new ApexCharts(chartContainer, {
+
+        // Prepare series for ApexCharts
+        const seriesData = data.map((item) => ({
+            x: getCheckedAtMs(item),
+            y: Number(item.cumulative_time || item.response_time || 0)
+        }));
+
+        currentStatuses = data.map((item) => item.health_status || 'unknown');
+
+        const options = {
             chart: {
                 type: 'bar',
                 height: 360,
-                toolbar: { show: false },
-                fontFamily: 'Trebuchet MS, Trebuchet, Arial, sans-serif',
-                foreColor: '#e5e7eb',
-                background: 'transparent',
+                animations: { enabled: true },
+                zoom: { enabled: true, type: 'x' },
+                toolbar: { show: true }
             },
+            plotOptions: {
+                bar: {
+                    horizontal: false,
+                    columnWidth: '60%',
+                    distributed: false
+                }
+            },
+            dataLabels: { enabled: false },
             series: [
-                { name: 'Success (ms)', data: greenData },
-                { name: 'Recovered (ms)', data: yellowData },
-                { name: 'Failed (ms)', data: redData },
+                {
+                    name: 'Latency (ms)',
+                    data: seriesData
+                }
             ],
-            colors: ['#34d399', '#fbbf24', '#fb7185'],
-            grid: { borderColor: 'rgba(148, 163, 184, 0.16)' },
             xaxis: {
-                categories: labels,
+                type: 'datetime',
                 labels: {
-                    rotate: -45,
-                    hideOverlappingLabels: true,
-                    style: { colors: '#cbd5e1' },
-                },
+                    formatter: (_value, timestamp) => formatChartTime(timestamp)
+                }
             },
             yaxis: {
-                labels: {
-                    formatter: (value) => Math.round(value),
-                    style: { colors: '#cbd5e1' },
-                },
+                title: { text: 'ms' }
             },
             tooltip: {
-                theme: 'dark',
-                fillSeriesColor: false,
-                style: { fontSize: '12px' },
-                y: {
-                    formatter: (value, { dataPointIndex }) => {
-                        const attempts = data[dataPointIndex]?.total_attempts || 1;
-                        return value ? `${value.toFixed(2)} ms (${attempts} attempt${attempts > 1 ? 's' : ''})` : '—';
-                    },
+                x: {
+                    formatter: (timestamp) => formatChartTime(timestamp)
                 },
+                y: { formatter: (val) => `${Number(val).toFixed(2)} ms` }
             },
-            legend: { position: 'top' },
-            plotOptions: { bar: { horizontal: false, columnWidth: '55%' } },
+            colors: [function ({ dataPointIndex }) {
+                const status = currentStatuses[dataPointIndex] || 'unknown';
+                return status === 'green' ? '#34d399' : status === 'yellow' ? '#fbbf24' : '#fb7185';
+            }]
+        };
+
+        const chartEl = document.createElement('div');
+        chartContainer.appendChild(chartEl);
+
+        if (myChart) {
+            try { myChart.destroy(); } catch (e) {}
+            myChart = null;
+        }
+
+        myChart = new ApexCharts(chartEl, options);
+        myChart.render().then(() => {
+            // Apply the current active range if set
+            if (Number.isFinite(activeChartDays) && activeChartDays > 0) {
+                const max = Date.now();
+                const min = max - activeChartDays * 24 * 60 * 60 * 1000;
+                try { myChart.updateOptions({ xaxis: { min, max } }, false, false); } catch (e) {}
+            }
         });
-        myChart.render();
+
+        if (data.length === 0) {
+            const emptyState = document.createElement('div');
+            emptyState.className = 'empty-state';
+            emptyState.textContent = 'No checks in this time range.';
+            chartContainer.appendChild(emptyState);
+        }
     }
 
     window.showChart = function showChart(id, name) {
@@ -210,65 +326,25 @@ function initDashboard() {
             .then((response) => response.json())
             .then((data) => {
                 allChartData = data;
-                renderChart(data, name);
+                renderChart(filterDataByDays(allChartData, activeChartDays));
                 modal.classList.add('is-open');
-                setupChartTimeRangeButtons();
             });
     };
 
-    function setupChartTimeRangeButtons() {
-        let existingButtons = document.getElementById('chartTimeRangeButtons');
-        if (existingButtons) {
-            existingButtons.remove();
-        }
-
-        const modalContent = document.querySelector('#chartModal .modal-content');
-        const buttonContainer = document.createElement('div');
-        buttonContainer.id = 'chartTimeRangeButtons';
-        buttonContainer.style.cssText = 'display: flex; gap: 8px; margin-bottom: 16px; justify-content: center;';
-
-        const ranges = [
-            { label: '1D', days: 1 },
-            { label: '7D', days: 7 },
-            { label: '30D', days: 30 },
-        ];
-
-        ranges.forEach((range) => {
-            const button = document.createElement('button');
-            button.className = 'btn-secondary';
-            button.textContent = range.label;
-            button.style.cssText = 'padding: 8px 16px; font-size: 0.9rem;';
-            button.onclick = () => {
-                const filtered = filterDataByDays(allChartData, range.days);
-                renderChart(filtered, '');
-                document.querySelectorAll('#chartTimeRangeButtons button').forEach((btn) => {
-                    btn.style.background = 'rgba(148, 163, 184, 0.12)';
-                });
-                button.style.background = 'rgba(34, 211, 238, 0.24)';
-            };
-            buttonContainer.appendChild(button);
+    document.querySelectorAll('#chartTimeRangeButtons .chart-range-button').forEach((button) => {
+        button.addEventListener('click', () => {
+            renderChartForDays(Number(button.dataset.days || '1'));
         });
-
-        modalContent.insertBefore(buttonContainer, modalContent.querySelector('.chart-wrap'));
-        document.querySelectorAll('#chartTimeRangeButtons button')[0].style.background = 'rgba(34, 211, 238, 0.24)';
-        const filtered = filterDataByDays(allChartData, 1);
-        renderChart(filtered, '');
-    }
+    });
 
     window.closeChart = function closeChart() {
         const modal = document.getElementById('chartModal');
         if (modal) {
             modal.classList.remove('is-open');
         }
-        if (myChart) {
-            myChart.destroy();
-            myChart = null;
-        }
         allChartData = [];
-        const buttonContainer = document.getElementById('chartTimeRangeButtons');
-        if (buttonContainer) {
-            buttonContainer.remove();
-        }
+        activeChartDays = 1;
+        updateChartRangeButtons(1);
     };
 
     window.openDeleteModal = function openDeleteModal(id, name) {

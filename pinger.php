@@ -177,9 +177,42 @@ function calculateUptimeMetrics($pdo, $siteId) {
     return ['uptime' => $uptime, 'outages' => $outageCount];
 }
 
+function buildMorningDigestMessage(array $site, array $metrics, array $result): string {
+    $uptimePercent = number_format((float)$metrics['uptime'], 2);
+    $outageCount = (int)$metrics['outages'];
+
+    if (($result['health_status'] ?? '') === 'red') {
+        $message = "🌅 Morning Catch-up: {$site['alias']} is still DOWN (Status: {$result['status_code']})\n";
+    } elseif (($result['health_status'] ?? '') === 'yellow') {
+        $message = "🌅 Morning Summary: {$site['alias']} recovered after retries.\n";
+    } else {
+        $message = "🌅 Morning Summary: {$site['alias']} is UP.\n";
+    }
+
+    $message .= "📊 Last 24h: {$uptimePercent}% uptime | {$outageCount} outage" . ($outageCount !== 1 ? 's' : '');
+
+    return $message;
+}
+
+function sendMorningDigest(PDO $pdo, array $site, array $result, array $config, string $today): bool {
+    $metrics = calculateUptimeMetrics($pdo, $site['id']);
+    $message = buildMorningDigestMessage($site, $metrics, $result);
+
+    if (!sendTelegram($message, $config)) {
+        return false;
+    }
+
+    $pdo->prepare("UPDATE sites SET pending_alert = 0, last_morning_summary_sent = ? WHERE id = ?")
+        ->execute([$today, $site['id']]);
+
+    return true;
+}
+
 // Set Timezone and check Quiet Time
 date_default_timezone_set($config['timezone'] ?? 'UTC');
 $currentHour = (int)date('H');
+$today = date('Y-m-d');
+$activeStartHour = (int)($config['active_start_hour'] ?? $quietEndHour ?? 8);
 $isQuietTime = isQuietTime($currentHour, $quietStartHour, $quietEndHour);
 
 $sites = $pdo->query("SELECT * FROM sites WHERE is_active = 1")->fetchAll();
@@ -187,6 +220,7 @@ $sites = $pdo->query("SELECT * FROM sites WHERE is_active = 1")->fetchAll();
 foreach ($sites as $site) {
     $timeout = (int)($site['timeout_seconds'] ?? $defaultTimeout);
     $retries = (int)($site['retries'] ?? $defaultRetries);
+    $summaryEnabled = (int)($site['morning_summary_enabled'] ?? 0) === 1;
     
     // Perform ping with retries
     $result = pingWithRetries($site['url'], $timeout, $retries);
@@ -211,6 +245,8 @@ foreach ($sites as $site) {
 
     // Determine if we should alert
     $isDown = ($result['health_status'] === 'red');
+    $needsMorningDigest = $summaryEnabled && !$isQuietTime && $currentHour >= $activeStartHour && (($site['last_morning_summary_sent'] ?? '') !== $today);
+    $morningDigestSent = false;
     
     if ($result['health_status'] === 'green') {
         $alertEmoji = '✅';
@@ -222,12 +258,16 @@ foreach ($sites as $site) {
         $alertEmoji = '❓';
     }
 
+    if ($needsMorningDigest) {
+        $morningDigestSent = sendMorningDigest($pdo, $site, $result, $config, $today);
+    }
+
     if ($isDown) {
         if ($isQuietTime) {
             // Flag for later notification
             $pdo->prepare("UPDATE sites SET pending_alert = 1 WHERE id = ?")
                 ->execute([$site['id']]);
-        } else {
+        } elseif (!$morningDigestSent) {
             // Send Alert Immediately
             $attemptsInfo = $result['total_attempts'] > 1 
                 ? " (failed after {$result['total_attempts']} attempts)" 
@@ -241,7 +281,7 @@ foreach ($sites as $site) {
         }
     } elseif ($result['health_status'] === 'yellow') {
         // Yellow status - recovered after retries
-        if (!$isQuietTime) {
+        if (!$isQuietTime && !$morningDigestSent) {
             sendTelegram(
                 "$alertEmoji RECOVERED: {$site['alias']} recovered after {$result['total_attempts']} attempts. Response Time: {$result['cumulative_time']}ms",
                 $config
@@ -249,18 +289,4 @@ foreach ($sites as $site) {
         }
     }
     // Green status - no alert needed
-}
-
-// Catch-up logic: If we just entered active hours, send pending alerts
-if (!$isQuietTime) {
-    $pending = $pdo->query("SELECT * FROM sites WHERE pending_alert = 1")->fetchAll();
-    foreach ($pending as $site) {
-        $metrics = calculateUptimeMetrics($pdo, $site['id']);
-        $uptimePercent = $metrics['uptime'];
-        $outageCount = $metrics['outages'];
-        $message = "🌅 Morning Catch-up: {$site['alias']} is still DOWN (Status: {$site['last_status']})\n";
-        $message .= "📊 Last 24h: {$uptimePercent}% uptime | {$outageCount} outage" . ($outageCount !== 1 ? 's' : '');
-        sendTelegram($message, $config);
-        $pdo->prepare("UPDATE sites SET pending_alert = 0 WHERE id = ?")->execute([$site['id']]);
-    }
 }

@@ -11,6 +11,8 @@ CREATE TABLE IF NOT EXISTS sites (
     last_status INT DEFAULT NULL,
     last_health_status VARCHAR(10) DEFAULT 'unknown', -- 'green', 'yellow', 'red'
     pending_alert BOOLEAN DEFAULT 0, -- Tracks alerts delayed due to Quiet Time
+    last_morning_summary_sent DATE DEFAULT NULL,
+    morning_summary_enabled BOOLEAN DEFAULT 0,
     timeout_seconds INT DEFAULT 30,
     retries INT DEFAULT 2,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
