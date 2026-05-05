@@ -100,7 +100,9 @@ function pingWithRetries($url, $timeout, $maxRetries) {
 }
 
 function sendTelegram($msg, $config) {
-    if (empty($config['telegram_bot_token']) || empty($config['telegram_chat_id'])) return;
+    if (empty($config['telegram_bot_token']) || empty($config['telegram_chat_id'])) {
+        return false;
+    }
 
     $url = "https://api.telegram.org/bot{$config['telegram_bot_token']}/sendMessage";
     $data = [

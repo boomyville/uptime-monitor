@@ -766,6 +766,15 @@ unset($_SESSION['flash_type']);
 
 <?php
 function sendTelegramMessage($botToken, $chatId, $message) {
+    if ($botToken === '' || $chatId === '') {
+        return [
+            'ok' => false,
+            'http_code' => 0,
+            'response' => '',
+            'description' => 'Telegram token and chat id are required.',
+        ];
+    }
+
     $url = "https://api.telegram.org/bot{$botToken}/sendMessage";
     $data = [
         'chat_id' => $chatId,
