@@ -345,6 +345,31 @@ label {
     border-color: rgba(34, 211, 238, 0.4);
 }
 
+.apexcharts-tooltip,
+.apexcharts-xaxistooltip,
+.apexcharts-yaxistooltip {
+    background: rgba(9, 17, 31, 0.98) !important;
+    color: var(--text) !important;
+    border: 1px solid rgba(99, 102, 241, 0.28) !important;
+    box-shadow: 0 16px 38px rgba(0, 0, 0, 0.32) !important;
+}
+
+.apexcharts-tooltip-title {
+    background: rgba(15, 23, 42, 0.98) !important;
+    color: var(--text) !important;
+    border-bottom-color: rgba(148, 163, 184, 0.16) !important;
+}
+
+.apexcharts-tooltip-text,
+.apexcharts-tooltip-text-label,
+.apexcharts-tooltip-text-value {
+    color: var(--text) !important;
+}
+
+.apexcharts-tooltip-marker {
+    border-color: rgba(255, 255, 255, 0.24) !important;
+}
+
 .modal {
     display: none;
     position: fixed;

@@ -13,6 +13,10 @@ CREATE TABLE IF NOT EXISTS sites (
     pending_alert BOOLEAN DEFAULT 0, -- Tracks alerts delayed due to Quiet Time
     last_morning_summary_sent DATE DEFAULT NULL,
     morning_summary_enabled BOOLEAN DEFAULT 0,
+    -- New per-site option: only send summary when uptime < 100%
+    morning_summary_only_on_issue BOOLEAN DEFAULT 0,
+    -- New per-site option: frequency for summary (daily|weekly|monthly)
+    morning_summary_frequency VARCHAR(10) DEFAULT 'daily',
     timeout_seconds INT DEFAULT 30,
     retries INT DEFAULT 2,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -40,8 +44,8 @@ CREATE TABLE IF NOT EXISTS config (
 );
 
 -- 5. Seed Initial Config Data
-INSERT INTO config (setting_key, setting_value) VALUES 
-('telegram_bot_token', ''), 
+INSERT INTO config (setting_key, setting_value) VALUES
+('telegram_bot_token', ''),
 ('telegram_chat_id', ''),
 ('admin_username', ''),
 ('admin_password_hash', ''),
@@ -50,4 +54,5 @@ INSERT INTO config (setting_key, setting_value) VALUES
 ('active_end_hour', '22'),         -- Notifications stop at 10 PM
 ('timezone', 'Australia/Melbourne'),
 ('default_timeout', '30'),         -- Default timeout in seconds
-('default_retries', '2');          -- Default number of retries
+('default_retries', '2'),          -- Default number of retries
+('morning_summary_frequency', 'daily'); -- Default global summary frequency

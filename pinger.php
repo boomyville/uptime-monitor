@@ -197,13 +197,24 @@ function buildMorningDigestMessage(array $site, array $metrics, array $result): 
 }
 
 function sendMorningDigest(PDO $pdo, array $site, array $result, array $config, string $today): bool {
+    // Compute recent metrics to build the message and for the "only on issue" check
     $metrics = calculateUptimeMetrics($pdo, $site['id']);
+
+    // Honor per-site "only send when uptime < 100%" flag
+    $onlyOnIssue = (int)($site['morning_summary_only_on_issue'] ?? 0) === 1;
+    if ($onlyOnIssue && isset($metrics['uptime']) && (float)$metrics['uptime'] >= 100.0) {
+        // Skip sending and do NOT update last_morning_summary_sent so that the
+        // next scheduled period can still attempt to send if an issue appears.
+        return false;
+    }
+
     $message = buildMorningDigestMessage($site, $metrics, $result);
 
     if (!sendTelegram($message, $config)) {
         return false;
     }
 
+    // Only mark as sent after successful delivery
     $pdo->prepare("UPDATE sites SET pending_alert = 0, last_morning_summary_sent = ? WHERE id = ?")
         ->execute([$today, $site['id']]);
 
@@ -247,7 +258,26 @@ foreach ($sites as $site) {
 
     // Determine if we should alert
     $isDown = ($result['health_status'] === 'red');
-    $needsMorningDigest = $summaryEnabled && !$isQuietTime && $currentHour >= $activeStartHour && (($site['last_morning_summary_sent'] ?? '') !== $today);
+
+    // Determine if this site's summary period is due based on preferred frequency
+    $frequency = strtolower(trim((string)($site['morning_summary_frequency'] ?? $config['morning_summary_frequency'] ?? 'daily')));
+    $lastSent = $site['last_morning_summary_sent'] ?? '';
+    $periodDue = false;
+    if (empty($lastSent)) {
+        $periodDue = true;
+    } else {
+        $daysSince = (int)floor((strtotime($today) - strtotime($lastSent)) / 86400);
+        if ($frequency === 'weekly') {
+            $periodDue = $daysSince >= 7;
+        } elseif ($frequency === 'monthly') {
+            $periodDue = $daysSince >= 30;
+        } else {
+            // daily (default)
+            $periodDue = ($lastSent !== $today);
+        }
+    }
+
+    $needsMorningDigest = $summaryEnabled && !$isQuietTime && $currentHour >= $activeStartHour && $periodDue;
     $morningDigestSent = false;
     
     if ($result['health_status'] === 'green') {

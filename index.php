@@ -182,10 +182,12 @@ if (!$isAdminConfigured || empty($_SESSION['is_admin_authenticated'])) {
     ?>
 <!DOCTYPE html>
 <html>
+<!DOCTYPE html>
+<html>
 <head>
     <title>Uptime Dashboard Access</title>
-    <link rel="stylesheet" href="styles.css">
-    <script defer src="app.js"></script>
+    <link rel="stylesheet" href="styles.css?v=<?= time() . rand() ?>">
+    <script defer src="app.js?v=<?= time() . rand() ?>"></script>
 </head>
 <body class="auth-page">
     <div class="auth-shell">
@@ -370,6 +372,21 @@ if (isset($_POST['save_monitoring_settings']) || isset($_POST['save_settings']))
     exit;
 }
 
+// Save per-site morning summary options
+if (isset($_POST['save_morning_summary_settings'])) {
+    $siteId = (int)$_POST['site_id'];
+    $onlyOnIssue = isset($_POST['morning_summary_only_on_issue']) && $_POST['morning_summary_only_on_issue'] === '1' ? 1 : 0;
+    $frequency = in_array($_POST['morning_summary_frequency'] ?? 'daily', ['daily','weekly','monthly'], true) ? $_POST['morning_summary_frequency'] : 'daily';
+
+    $pdo->prepare("UPDATE sites SET morning_summary_only_on_issue = ?, morning_summary_frequency = ? WHERE id = ?")
+        ->execute([$onlyOnIssue, $frequency, $siteId]);
+
+    $_SESSION['flash_message'] = 'Morning summary options saved for the site.';
+    $_SESSION['flash_type'] = 'success';
+    header('Location: index.php');
+    exit;
+}
+
 if (isset($_POST['save_telegram_settings'])) {
     $settings = [
         'telegram_bot_token' => trim($_POST['telegram_bot_token']),
@@ -461,18 +478,80 @@ if (isset($_GET['get_stats'])) {
     header('Content-Type: application/json');
     $configRows = $pdo->query("SELECT setting_key, setting_value FROM config")->fetchAll(PDO::FETCH_KEY_PAIR);
     $serverTimezone = new DateTimeZone($configRows['timezone'] ?? 'UTC');
-    $stmt = $pdo->prepare(
-        "SELECT cumulative_time, health_status, total_attempts, checked_at FROM logs 
-         WHERE site_id = ? ORDER BY checked_at DESC LIMIT 50"
-    );
-    $stmt->execute([$_GET['get_stats']]);
-    $rows = array_reverse($stmt->fetchAll());
+    // If a 'days' parameter was provided and is >= 7, return hourly-aggregated
+    // max cumulative_time per hour (and a conservative health_status for the
+    // hour) to reduce payload size and improve chart performance.
+    $days = isset($_GET['days']) ? (int)$_GET['days'] : 0;
+
+    if ($days >= 7) {
+        // Compute cutoff in PHP to avoid issues with binding inside INTERVAL in SQL.
+        $cutoff = date('Y-m-d H:i:s', time() - ($days * 86400));
+
+        // Group by 4-hour bucket and return one point per bucket (timestamp at bucket start).
+        $stmt = $pdo->prepare(
+            "SELECT
+                (FLOOR(UNIX_TIMESTAMP(checked_at) / 14400) * 14400 * 1000) AS checked_at_ms,
+                FROM_UNIXTIME(FLOOR(UNIX_TIMESTAMP(checked_at) / 14400) * 14400) AS checked_at,
+                MAX(cumulative_time) AS cumulative_time,
+                -- conservative health status: red if any red in bucket, else yellow if any yellow, else green
+                CASE
+                    WHEN SUM(CASE WHEN health_status = 'red' THEN 1 ELSE 0 END) > 0 THEN 'red'
+                    WHEN SUM(CASE WHEN health_status = 'yellow' THEN 1 ELSE 0 END) > 0 THEN 'yellow'
+                    ELSE 'green'
+                END AS health_status,
+                MAX(total_attempts) AS total_attempts
+             FROM logs
+             WHERE site_id = ? AND checked_at >= ?
+             GROUP BY FLOOR(UNIX_TIMESTAMP(checked_at) / 14400)
+             ORDER BY checked_at ASC"
+        );
+        $stmt->execute([$_GET['get_stats'], $cutoff]);
+        $rows = $stmt->fetchAll();
+
+        // Ensure checked_at_ms is integer
+        foreach ($rows as &$row) {
+            if (isset($row['checked_at_ms']) && is_numeric($row['checked_at_ms'])) {
+                $row['checked_at_ms'] = (int)$row['checked_at_ms'];
+            } else {
+                $row['checked_at_ms'] = (int)(strtotime((string)$row['checked_at']) * 1000);
+            }
+        }
+        unset($row);
+
+        // Tell the client which 'days' window this response corresponds to
+        header('X-Requested-Days: ' . $days);
+        echo json_encode($rows);
+        exit;
+    }
+
+    // Default: return raw rows. If a small `days` window is requested (<7)
+    // the DB will filter by that window to avoid returning the whole history.
+    if ($days > 0 && $days < 7) {
+        $stmt = $pdo->prepare(
+            "SELECT cumulative_time, health_status, total_attempts, checked_at, (UNIX_TIMESTAMP(checked_at) * 1000) AS checked_at_ms FROM logs
+             WHERE site_id = ? AND checked_at >= DATE_SUB(NOW(), INTERVAL ? DAY) ORDER BY checked_at ASC"
+        );
+        $stmt->execute([$_GET['get_stats'], $days]);
+    } else {
+        // No small-days window requested: return recent rows but limit to avoid huge payloads
+        $stmt = $pdo->prepare(
+            "SELECT cumulative_time, health_status, total_attempts, checked_at, (UNIX_TIMESTAMP(checked_at) * 1000) AS checked_at_ms FROM logs
+             WHERE site_id = ? ORDER BY checked_at ASC LIMIT 1000"
+        );
+        $stmt->execute([$_GET['get_stats']]);
+    }
+    $rows = $stmt->fetchAll();
+
     foreach ($rows as &$row) {
-        $checkedAt = DateTimeImmutable::createFromFormat('Y-m-d H:i:s', $row['checked_at'], $serverTimezone);
-        if ($checkedAt instanceof DateTimeImmutable) {
-            $row['checked_at_ms'] = $checkedAt->getTimestamp() * 1000;
+        if (isset($row['checked_at_ms']) && is_numeric($row['checked_at_ms'])) {
+            $row['checked_at_ms'] = (int)$row['checked_at_ms'];
         } else {
-            $row['checked_at_ms'] = strtotime((string)$row['checked_at']) * 1000;
+            $checkedAt = DateTimeImmutable::createFromFormat('Y-m-d H:i:s', $row['checked_at'], $serverTimezone);
+            if ($checkedAt instanceof DateTimeImmutable) {
+                $row['checked_at_ms'] = $checkedAt->getTimestamp() * 1000;
+            } else {
+                $row['checked_at_ms'] = (int)(strtotime((string)$row['checked_at']) * 1000);
+            }
         }
     }
     unset($row);
@@ -546,16 +625,51 @@ $flashMessage = $_SESSION['flash_message'] ?? '';
  $flashType = $_SESSION['flash_type'] ?? 'success';
 unset($_SESSION['flash_message']);
 unset($_SESSION['flash_type']);
+
+// Generate test data if requested
+if (isset($_GET['generate_test_data']) && $_GET['generate_test_data'] === '1') {
+    foreach ($sites as $site) {
+        $siteId = $site['id'];
+        // Generate 50 data points spread across the last 30 days
+        for ($i = 0; $i < 50; $i++) {
+            $daysAgo = floor(($i / 50) * 30); // Spread from 0 to 30 days
+            $hoursAgo = ($i % 6) * 4; // 4 hour intervals
+            $timestamp = date('Y-m-d H:i:s', time() - ($daysAgo * 86400) - ($hoursAgo * 3600));
+            
+            $statuses = ['green', 'green', 'green', 'yellow', 'red'];
+            $status = $statuses[array_rand($statuses)];
+            $responseTime = rand(50, 800);
+            $cumulativeTime = $status === 'green' ? $responseTime : $responseTime * rand(2, 5);
+            
+            $pdo->prepare(
+                "INSERT INTO logs (site_id, status_code, response_time, health_status, total_attempts, cumulative_time, checked_at) 
+                 VALUES (?, ?, ?, ?, ?, ?, ?)"
+            )->execute([
+                $siteId,
+                $status === 'green' ? 200 : ($status === 'yellow' ? 200 : 503),
+                $responseTime,
+                $status,
+                $status === 'yellow' ? 2 : 1,
+                $cumulativeTime,
+                $timestamp
+            ]);
+        }
+    }
+    $_SESSION['flash_message'] = 'Test data generated! Refresh to see 30 days of monitoring data spread across the chart.';
+    $_SESSION['flash_type'] = 'success';
+    header('Location: index.php');
+    exit;
+}
 ?>
 
 <!DOCTYPE html>
 <html>
 <head>
     <title>Boomarian Uptime Dashboard</title>
-    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="styles.css?v=<?= time() . rand() ?>">
     <script>window.UPTIME_TIMEZONE = <?= json_encode($dashboardTimezone) ?>;</script>
     <script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>
-    <script defer src="app.js"></script>
+    <script defer src="app.js?v=<?= time() . rand() ?>"></script>
 </head>
 <body class="dashboard-page">
     <div class="container">
@@ -605,9 +719,27 @@ unset($_SESSION['flash_type']);
                                 <input type="hidden" name="morning_summary_enabled" value="<?= $summaryEnabled ? 0 : 1 ?>">
                                 <button type="submit" name="toggle_morning_summary" class="btn-secondary btn-mini"><?= $summaryEnabled ? 'Disable Summary' : 'Enable Summary' ?></button>
                             </form>
+
                             <form method="POST" class="inline">
                                 <input type="hidden" name="site_id" value="<?= $s['id'] ?>">
                                 <button type="submit" name="send_summary" class="btn-secondary btn-mini">Send Summary</button>
+                            </form>
+
+                            <!-- Per-site summary options: only send on issue and frequency -->
+                            <form method="POST" class="inline">
+                                <input type="hidden" name="site_id" value="<?= $s['id'] ?>">
+                                <?php $onlyOnIssue = (int)($s['morning_summary_only_on_issue'] ?? 0) === 1; ?>
+                                <label style="display:inline-flex;align-items:center;gap:6px;">
+                                    <input type="checkbox" name="morning_summary_only_on_issue" value="1" <?= $onlyOnIssue ? 'checked' : '' ?>>
+                                    <span style="font-size:12px">Only on issue</span>
+                                </label>
+                                <select name="morning_summary_frequency" style="margin-left:8px;font-size:12px">
+                                    <?php $freq = htmlspecialchars($s['morning_summary_frequency'] ?? $config['morning_summary_frequency'] ?? 'daily'); ?>
+                                    <option value="daily" <?= $freq === 'daily' ? 'selected' : '' ?>>Daily</option>
+                                    <option value="weekly" <?= $freq === 'weekly' ? 'selected' : '' ?>>Weekly</option>
+                                    <option value="monthly" <?= $freq === 'monthly' ? 'selected' : '' ?>>Monthly</option>
+                                </select>
+                                <button type="submit" name="save_morning_summary_settings" class="btn-secondary btn-mini" style="margin-left:8px">Save</button>
                             </form>
                         </div>
                     </td>
@@ -657,6 +789,7 @@ unset($_SESSION['flash_type']);
                 </select>
                 <button type="submit" name="clear_logs" class="btn-danger">Cleanup Logs</button>
             </form>
+            <p style="margin-top: 12px; font-size: 12px;"><a href="?generate_test_data=1" style="color: #cbd5e1; text-decoration: underline;">Generate test data (30 days spread)</a></p>
         </div>
 
         <div class="card">
