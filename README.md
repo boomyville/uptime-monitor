@@ -57,6 +57,7 @@ Database connection and PHP runtime settings.
 - Defines database credentials
 - Creates the PDO connection helper used by the other scripts
 - Enables error reporting for debugging
+- Optionally defines `NOTIFIER_URL` so Telegram messages can link back to the dashboard
 
 Create this file locally and add your own database details. It is ignored by git because it contains local secrets.
 
@@ -85,6 +86,9 @@ function getDbConnection() {
 		die("Database connection failed: " . $e->getMessage());
 	}
 }
+
+// Optional absolute URL for Telegram links back to the dashboard.
+define('NOTIFIER_URL', 'https://your-host.example/uptime-monitor');
 ```
 
 Make sure the file exists at the project root as `config.php` before running the dashboard.

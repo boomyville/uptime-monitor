@@ -14,6 +14,7 @@ $quietStartHour = (int)($config['quiet_start_hour'] ?? $config['active_end_hour'
 $quietEndHour = (int)($config['quiet_end_hour'] ?? $config['active_start_hour'] ?? 8);
 $defaultTimeout = (int)($config['default_timeout'] ?? 30);
 $defaultRetries = (int)($config['default_retries'] ?? 2);
+$notifierUrl = getNotifierUrl($config);
 
 function isQuietTime(int $currentHour, int $quietStartHour, int $quietEndHour): bool {
     if ($quietStartHour === $quietEndHour) {
@@ -179,7 +180,7 @@ function calculateUptimeMetrics($pdo, $siteId) {
     return ['uptime' => $uptime, 'outages' => $outageCount];
 }
 
-function buildMorningDigestMessage(array $site, array $metrics, array $result): string {
+function buildMorningDigestMessage(array $site, array $metrics, array $result, string $notifierUrl = ''): string {
     $uptimePercent = number_format((float)$metrics['uptime'], 2);
     $outageCount = (int)$metrics['outages'];
 
@@ -192,6 +193,7 @@ function buildMorningDigestMessage(array $site, array $metrics, array $result): 
     }
 
     $message .= "📊 Last 24h: {$uptimePercent}% uptime | {$outageCount} outage" . ($outageCount !== 1 ? 's' : '');
+    $message .= buildTelegramNotifierSuffix($notifierUrl);
 
     return $message;
 }
@@ -208,7 +210,7 @@ function sendMorningDigest(PDO $pdo, array $site, array $result, array $config, 
         return false;
     }
 
-    $message = buildMorningDigestMessage($site, $metrics, $result);
+    $message = buildMorningDigestMessage($site, $metrics, $result, getNotifierUrl($config));
 
     if (!sendTelegram($message, $config)) {
         return false;
@@ -305,7 +307,7 @@ foreach ($sites as $site) {
                 ? " (failed after {$result['total_attempts']} attempts)" 
                 : '';
             sendTelegram(
-                "$alertEmoji ALERT: {$site['alias']} ({$site['url']}) is DOWN. Status: {$result['status_code']}{$attemptsInfo}",
+                "$alertEmoji ALERT: {$site['alias']} ({$site['url']}) is DOWN. Status: {$result['status_code']}{$attemptsInfo}" . buildTelegramNotifierSuffix($notifierUrl),
                 $config
             );
             $pdo->prepare("UPDATE sites SET pending_alert = 0 WHERE id = ?")
@@ -315,7 +317,7 @@ foreach ($sites as $site) {
         // Yellow status - recovered after retries
         if (!$isQuietTime && !$morningDigestSent) {
             sendTelegram(
-                "$alertEmoji RECOVERED: {$site['alias']} recovered after {$result['total_attempts']} attempts. Response Time: {$result['cumulative_time']}ms",
+                "$alertEmoji RECOVERED: {$site['alias']} recovered after {$result['total_attempts']} attempts. Response Time: {$result['cumulative_time']}ms" . buildTelegramNotifierSuffix($notifierUrl),
                 $config
             );
         }

@@ -107,6 +107,7 @@ $adminUsername = trim((string)($configDefaults['admin_username'] ?? ''));
 $adminPasswordHash = (string)($configDefaults['admin_password_hash'] ?? '');
 $adminPasswordSalt = (string)($configDefaults['admin_password_salt'] ?? '');
 $isAdminConfigured = $adminUsername !== '' && $adminPasswordHash !== '' && $adminPasswordSalt !== '';
+$notifierUrl = getNotifierUrl($configDefaults);
 
 if (isset($_POST['admin_logout'])) {
     unset($_SESSION['is_admin_authenticated'], $_SESSION['admin_username']);
@@ -273,7 +274,7 @@ if (isset($_POST['send_summary'])) {
         $today = (new DateTimeImmutable('now', new DateTimeZone($configDefaults['timezone'] ?? 'UTC')))->format('Y-m-d');
         $result = pingSite($pdo, $site['id'], $site['url'], $site['alias'], $timeout, $retries);
         $metrics = calculateSiteSummaryMetrics($pdo, (int)$site['id'], 1);
-        $message = buildMorningDigestMessage($site, $metrics, $result);
+        $message = buildMorningDigestMessage($site, $metrics, $result, $notifierUrl);
         $telegramBotToken = (string)($configDefaults['telegram_bot_token'] ?? '');
         $telegramChatId = (string)($configDefaults['telegram_chat_id'] ?? '');
 
@@ -427,7 +428,8 @@ if (isset($_POST['test_telegram'])) {
             $_SESSION['flash_message'] = "Telegram verification failed: {$details}";
             $_SESSION['flash_type'] = 'error';
         } else {
-            $telegramResult = sendTelegramMessage($telegramBotToken, $telegramChatId, 'Test message from Uptime Dashboard: Telegram alerts are configured correctly.');
+            $testMessage = 'Test message from Uptime Dashboard: Telegram alerts are configured correctly.' . buildTelegramNotifierSuffix($notifierUrl);
+            $telegramResult = sendTelegramMessage($telegramBotToken, $telegramChatId, $testMessage);
 
             if ($telegramResult['ok']) {
                 $httpStatus = $telegramResult['http_code'] ? "HTTP {$telegramResult['http_code']}" : 'no HTTP status';
@@ -595,7 +597,7 @@ function calculateSiteSummaryMetrics(PDO $pdo, int $siteId, int $days): array {
     ];
 }
 
-function buildMorningDigestMessage(array $site, array $metrics, array $result): string {
+function buildMorningDigestMessage(array $site, array $metrics, array $result, string $notifierUrl = ''): string {
     $uptimePercent = number_format((float)$metrics['uptime'], 2);
     $outageCount = (int)$metrics['outages'];
 
@@ -608,6 +610,7 @@ function buildMorningDigestMessage(array $site, array $metrics, array $result): 
     }
 
     $message .= "📊 Last 24h: {$uptimePercent}% uptime | {$outageCount} outage" . ($outageCount !== 1 ? 's' : '');
+    $message .= buildTelegramNotifierSuffix($notifierUrl);
 
     return $message;
 }
