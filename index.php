@@ -22,59 +22,72 @@ function pingWithRetries($url, $timeout, $maxRetries) {
     $firstAttemptTime = 0;
     $attemptCount = 0;
     $allFailed = true;
+    $lastCurlError = '';
 
     for ($attempt = 0; $attempt <= $maxRetries; $attempt++) {
         $attemptCount++;
         $ch = curl_init($url);
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => $timeout,
+            CURLOPT_TIMEOUT        => $timeout,
             CURLOPT_CONNECTTIMEOUT => $timeout,
-            CURLOPT_USERAGENT => 'UptimeMonitor/1.0',
-            CURLOPT_FAILONERROR => false
+            CURLOPT_USERAGENT      => 'UptimeMonitor/1.0',
+            CURLOPT_FAILONERROR    => false,
         ]);
-        
-        $start = microtime(true);
+
+        $start   = microtime(true);
         curl_exec($ch);
-        $elapsed = (microtime(true) - $start) * 1000; // Convert to ms
+        $elapsed   = (microtime(true) - $start) * 1000;
         $http_code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curlErrno = curl_errno($ch);
+        $curlError = curl_error($ch);
         curl_close($ch);
 
-        // Store first attempt time
         if ($attempt === 0) {
             $firstAttemptTime = round($elapsed, 2);
         }
 
-        $cumulativeTime += $elapsed;
-        $finalStatusCode = $http_code;
+        $cumulativeTime  += $elapsed;
+        $finalStatusCode  = $http_code;
+        $lastCurlError    = $curlError;
 
-        // Check if this attempt succeeded (HTTP code < 400, or code > 0)
-        $isSuccess = ($http_code > 0 && $http_code < 400);
-        
+        // HTTP code 0 with a curl network error means OUR server couldn't reach
+        // anything — treat as inconclusive rather than a site outage.
+        $isNetworkError = ($http_code === 0 && $curlErrno !== 0);
+        $isSuccess      = (!$isNetworkError && $http_code > 0 && $http_code < 400);
+
         if ($isSuccess) {
             $allFailed = false;
-            break; // Success! Stop retrying
+            break;
+        }
+
+        // Don't bother retrying if it's our own network that's broken
+        if ($isNetworkError) {
+            break;
         }
     }
 
     // Determine health status
-    if ($attemptCount === 1 && $finalStatusCode > 0 && $finalStatusCode < 400) {
-        // Green: succeeded on first try
+    $isNetworkError = ($finalStatusCode === 0 && $lastCurlError !== '');
+
+    if ($isNetworkError) {
+        // Our monitor lost connectivity — don't record as a site outage
+        $healthStatus = 'unknown';
+    } elseif ($attemptCount === 1 && $finalStatusCode > 0 && $finalStatusCode < 400) {
         $healthStatus = 'green';
     } elseif (!$allFailed) {
-        // Yellow: failed at least once, but eventually succeeded
         $healthStatus = 'yellow';
     } else {
-        // Red: failed all retries
         $healthStatus = 'red';
     }
 
     return [
-        'status_code' => $finalStatusCode,
-        'response_time' => $firstAttemptTime,
+        'status_code'    => $finalStatusCode,
+        'response_time'  => $firstAttemptTime,
         'cumulative_time' => round($cumulativeTime, 2),
         'total_attempts' => $attemptCount,
-        'health_status' => $healthStatus
+        'health_status'  => $healthStatus,
+        'curl_error'     => $lastCurlError,
     ];
 }
 

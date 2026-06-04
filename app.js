@@ -458,11 +458,13 @@ function initDashboard() {
         chartContainer.innerHTML = '';
 
         // Prepare series for ApexCharts
-        const seriesData = data.map((item) => ({
-            x: getCheckedAtMs(item),
-            y: Number(item.cumulative_time || item.response_time || 0)
-        }));
-
+        const seriesData = data.map((item) => {
+            const y = Number(item.cumulative_time || item.response_time || 0);
+            return {
+                x: getCheckedAtMs(item),
+                y: y > 0 ? y : null   // null renders as a gap; 0 would break log scale
+            };
+        });
         // Always use the requested time range for the x-axis, not the data bounds.
         // This prevents the chart from appearing to show a shorter window than selected.
         const dayMs = 24 * 60 * 60 * 1000;
@@ -527,7 +529,12 @@ function initDashboard() {
                 }
             },
             yaxis: {
-                title: { text: 'ms' }
+                title: { text: 'ms' },
+                logarithmic: true,
+                logBase: 10,
+                labels: {
+                    formatter: (val) => val == null ? '' : Math.round(val) + 'ms'
+                }
             },
             tooltip: {
                 theme: 'dark',
