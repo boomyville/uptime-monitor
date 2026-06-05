@@ -192,6 +192,7 @@ function calculateUptimeMetrics($pdo, $siteId) {
             $successfulChecks++;
         }
     }
+}
 
     $uptime = $totalChecks > 0 ? round(($successfulChecks / $totalChecks) * 100, 2) : 0;
 
