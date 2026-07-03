@@ -90,10 +90,11 @@ function pingWithRetries($url, $timeout, $maxRetries) {
         'curl_error'     => $lastCurlError,
     ];
 }
-
 function pingSite($pdo, $id, $url, $alias, $timeout = 30, $retries = 2) {
+    // 1. ALWAYS execute the network check
     $result = pingWithRetries($url, $timeout, $retries);
     
+    // 2. Log the execution straight to database logs
     $pdo->prepare(
         "INSERT INTO logs (site_id, status_code, response_time, cumulative_time, total_attempts, health_status) 
          VALUES (?, ?, ?, ?, ?, ?)"
@@ -106,12 +107,12 @@ function pingSite($pdo, $id, $url, $alias, $timeout = 30, $retries = 2) {
         $result['health_status']
     ]);
     
+    // 3. Keep the dashboard metrics updated
     $pdo->prepare("UPDATE sites SET last_status = ?, last_health_status = ? WHERE id = ?")
         ->execute([$result['status_code'], $result['health_status'], $id]);
 
     return $result;
 }
-
 // Load config defaults
 $configDefaults = $pdo->query("SELECT setting_key, setting_value FROM config")->fetchAll(PDO::FETCH_KEY_PAIR);
 $defaultTimeout = (int)($configDefaults['default_timeout'] ?? 30);
@@ -489,26 +490,23 @@ if (isset($_POST['verify_telegram'])) {
 }
 
 // JSON Endpoint for Chart Data (includes cumulative time and health status)
+// JSON Endpoint for Chart Data (includes cumulative time and health status)
 if (isset($_GET['get_stats'])) {
     header('Content-Type: application/json');
     $configRows = $pdo->query("SELECT setting_key, setting_value FROM config")->fetchAll(PDO::FETCH_KEY_PAIR);
     $serverTimezone = new DateTimeZone($configRows['timezone'] ?? 'UTC');
-    // If a 'days' parameter was provided and is >= 7, return hourly-aggregated
-    // max cumulative_time per hour (and a conservative health_status for the
-    // hour) to reduce payload size and improve chart performance.
+    
+    // If a 'days' parameter was provided and is >= 7, return hourly-aggregated data
     $days = isset($_GET['days']) ? (int)$_GET['days'] : 0;
 
     if ($days >= 7) {
-        // Compute cutoff in PHP to avoid issues with binding inside INTERVAL in SQL.
         $cutoff = date('Y-m-d H:i:s', time() - ($days * 86400));
 
-        // Group by 4-hour bucket and return one point per bucket (timestamp at bucket start).
         $stmt = $pdo->prepare(
             "SELECT
                 (FLOOR(UNIX_TIMESTAMP(checked_at) / 14400) * 14400 * 1000) AS checked_at_ms,
                 FROM_UNIXTIME(FLOOR(UNIX_TIMESTAMP(checked_at) / 14400) * 14400) AS checked_at,
                 MAX(cumulative_time) AS cumulative_time,
-                -- conservative health status: red if any red in bucket, else yellow if any yellow, else green
                 CASE
                     WHEN SUM(CASE WHEN health_status = 'red' THEN 1 ELSE 0 END) > 0 THEN 'red'
                     WHEN SUM(CASE WHEN health_status = 'yellow' THEN 1 ELSE 0 END) > 0 THEN 'yellow'
@@ -523,7 +521,6 @@ if (isset($_GET['get_stats'])) {
         $stmt->execute([$_GET['get_stats'], $cutoff]);
         $rows = $stmt->fetchAll();
 
-        // Ensure checked_at_ms is integer
         foreach ($rows as &$row) {
             if (isset($row['checked_at_ms']) && is_numeric($row['checked_at_ms'])) {
                 $row['checked_at_ms'] = (int)$row['checked_at_ms'];
@@ -533,29 +530,33 @@ if (isset($_GET['get_stats'])) {
         }
         unset($row);
 
-        // Tell the client which 'days' window this response corresponds to
         header('X-Requested-Days: ' . $days);
         echo json_encode($rows);
         exit;
     }
 
-    // Default: return raw rows. If a small `days` window is requested (<7)
-    // the DB will filter by that window to avoid returning the whole history.
+    // Small-days window requested: (<7) filter by window
     if ($days > 0 && $days < 7) {
         $stmt = $pdo->prepare(
             "SELECT cumulative_time, health_status, total_attempts, checked_at, (UNIX_TIMESTAMP(checked_at) * 1000) AS checked_at_ms FROM logs
              WHERE site_id = ? AND checked_at >= DATE_SUB(NOW(), INTERVAL ? DAY) ORDER BY checked_at ASC"
         );
         $stmt->execute([$_GET['get_stats'], $days]);
+        $rows = $stmt->fetchAll();
     } else {
-        // No small-days window requested: return recent rows but limit to avoid huge payloads
+        // CHANGED HERE: Grab the LATEST 1000 points instead of the oldest ones
         $stmt = $pdo->prepare(
-            "SELECT cumulative_time, health_status, total_attempts, checked_at, (UNIX_TIMESTAMP(checked_at) * 1000) AS checked_at_ms FROM logs
-             WHERE site_id = ? ORDER BY checked_at ASC LIMIT 1000"
+            "SELECT cumulative_time, health_status, total_attempts, checked_at, (UNIX_TIMESTAMP(checked_at) * 1000) AS checked_at_ms 
+             FROM logs
+             WHERE site_id = ? 
+             ORDER BY checked_at DESC LIMIT 1000"
         );
         $stmt->execute([$_GET['get_stats']]);
+        $rows = $stmt->fetchAll();
+        
+        // CHANGED HERE: Flip it back chronologically so ApexCharts renders properly
+        $rows = array_reverse($rows);
     }
-    $rows = $stmt->fetchAll();
 
     foreach ($rows as &$row) {
         if (isset($row['checked_at_ms']) && is_numeric($row['checked_at_ms'])) {
@@ -570,6 +571,7 @@ if (isset($_GET['get_stats'])) {
         }
     }
     unset($row);
+    
     echo json_encode($rows);
     exit;
 }
